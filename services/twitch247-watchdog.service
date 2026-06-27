@@ -1,0 +1,12 @@
+[Unit]
+Description=Twitch247 Watchdog - Health check and 48h stream restart
+Documentation=https://github.com/galitubereal/twitch247
+After=twitch247.service twitch247-dashboard.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/twitch247/scripts/watchdog.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitch247-watchdog

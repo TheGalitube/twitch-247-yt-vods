@@ -1,0 +1,36 @@
+[Unit]
+Description=Twitch247 - 24/7 YouTube VOD to Twitch Streamer
+Documentation=https://github.com/galitubereal/twitch247
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=twitch247
+Group=twitch247
+WorkingDirectory=/opt/twitch247
+Environment=TWITCH247_CONFIG=/opt/twitch247/config/config.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/twitch247/venv/bin/python -m app.main
+Restart=always
+RestartSec=10
+
+# Graceful shutdown: save state before exit
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/twitch247/database /opt/twitch247/logs
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitch247
+
+[Install]
+WantedBy=multi-user.target

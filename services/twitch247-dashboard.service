@@ -1,0 +1,29 @@
+[Unit]
+Description=Twitch247 Dashboard - Monitoring Web UI
+Documentation=https://github.com/galitubereal/twitch247
+After=network-online.target twitch247.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=twitch247
+Group=twitch247
+WorkingDirectory=/opt/twitch247
+Environment=TWITCH247_CONFIG=/opt/twitch247/config/config.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/twitch247/venv/bin/python -m dashboard
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/twitch247/database /opt/twitch247/logs
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twitch247-dashboard
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Twitch247 watchdog every 30 minutes
+Documentation=https://github.com/galitubereal/twitch247
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
