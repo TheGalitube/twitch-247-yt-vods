@@ -76,4 +76,19 @@ if [[ "$FFMPEG_COUNT" -eq 0 ]]; then
     fi
 fi
 
+for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
+    RTMP_SOCKET=$(ss -tanp 2>/dev/null | grep "pid=${pid}," | grep ":1935" || true)
+    if [[ -z "$RTMP_SOCKET" ]]; then
+        log "WARN: RTMP ffmpeg pid ${pid} has no Twitch TCP connection — restarting streamer"
+        systemctl restart twitch247.service
+        exit 0
+    fi
+
+    if ss -tanp state close-wait 2>/dev/null | grep -q "pid=${pid},"; then
+        log "WARN: RTMP ffmpeg pid ${pid} has Twitch TCP connection in CLOSE-WAIT — restarting streamer"
+        systemctl restart twitch247.service
+        exit 0
+    fi
+done
+
 log "INFO: Health check passed"

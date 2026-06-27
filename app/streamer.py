@@ -31,6 +31,16 @@ class Streamer:
     OUTPUT_WIDTH = 1920
     OUTPUT_HEIGHT = 1080
     OUTPUT_FPS = 60
+    OUTPUT_HEALTH_CHECK_INTERVAL = 5.0
+    OUTPUT_STARTUP_GRACE_SECONDS = 30.0
+    TCP_CLOSED_STATES = {
+        "04",  # FIN_WAIT1
+        "05",  # FIN_WAIT2
+        "07",  # CLOSE
+        "08",  # CLOSE_WAIT
+        "09",  # LAST_ACK
+        "0B",  # CLOSING
+    }
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -41,6 +51,7 @@ class Streamer:
         self._closing = threading.Event()
         self._fifo_path = self.config.log_dir / "twitch247-rtmp.pipe"
         self._fifo_keepalive_fd: int | None = None
+        self._output_started_at = 0.0
 
     def stream_video(
         self,
@@ -120,6 +131,7 @@ class Streamer:
             stderr_tail: list[str] = []
             finished_naturally = False
             output_dropped = False
+            last_output_health_check = time.monotonic()
 
             def set_position(position: float) -> None:
                 nonlocal last_position
@@ -170,6 +182,19 @@ class Streamer:
                         break
 
                     now = time.monotonic()
+                    if (
+                        now - last_output_health_check
+                        >= self.OUTPUT_HEALTH_CHECK_INTERVAL
+                    ):
+                        last_output_health_check = now
+                        if self._output_tcp_connection_closed():
+                            output_dropped = True
+                            self._output_dead.set()
+                            logger.warning(
+                                "RTMP output TCP connection closed, restarting stream"
+                            )
+                            break
+
                     if now - last_save >= self.config.save_interval:
                         elapsed = now - wall_start
                         position = seek_pos + elapsed
@@ -219,21 +244,27 @@ class Streamer:
                     return StreamResult(success=True, final_position=final_position)
 
                 stderr_joined = " ".join(stderr_tail[-10:])
-                retryable_output_failure = output_dropped or returncode in (-9, 255) or (
+                output_failure = output_dropped or (
                     "Broken pipe" in stderr_joined
-                    or "Invalid data found when processing input" in stderr_joined
+                    or "Input/output error" in stderr_joined
+                    or "Connection reset by peer" in stderr_joined
+                )
+                transient_input_failure = returncode in (-9, 255) or (
+                    "Invalid data found when processing input" in stderr_joined
                     or "HTTP error 403 Forbidden" in stderr_joined
                 )
-                if retryable_output_failure and attempt < max_output_retries:
+                if (output_failure or transient_input_failure) and attempt < max_output_retries:
                     current_position = max(final_position, current_position)
                     logger.warning(
-                        "Stream dropped, retrying %s at %.1fs (attempt %d/%d)",
+                        "%s dropped, retrying %s at %.1fs (attempt %d/%d)",
+                        "RTMP output" if output_failure else "Input stream",
                         video_id,
                         current_position,
                         attempt,
                         max_output_retries,
                     )
-                    self._stop_output_process()
+                    if output_failure:
+                        self._stop_output_process()
                     time.sleep(2)
                     continue
 
@@ -301,6 +332,7 @@ class Streamer:
                 stderr=subprocess.PIPE,
                 bufsize=0,
             )
+            self._output_started_at = time.monotonic()
             self._output_stderr_thread = threading.Thread(
                 target=self._drain_output_stderr,
                 name="ffmpeg-rtmp-output",
@@ -384,6 +416,55 @@ class Streamer:
         if self._output_proc is proc and not self._closing.is_set():
             self._output_dead.set()
             logger.error("RTMP output process exited unexpectedly")
+
+    def _output_tcp_connection_closed(self) -> bool:
+        proc = self._output_proc
+        if not proc or proc.poll() is not None:
+            return True
+        if (
+            self._output_started_at
+            and time.monotonic() - self._output_started_at
+            < self.OUTPUT_STARTUP_GRACE_SECONDS
+        ):
+            return False
+
+        socket_inodes: set[str] = set()
+        fd_dir = f"/proc/{proc.pid}/fd"
+        try:
+            for fd_name in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(os.path.join(fd_dir, fd_name))
+                except OSError:
+                    continue
+                match = re.fullmatch(r"socket:\[(\d+)\]", target)
+                if match:
+                    socket_inodes.add(match.group(1))
+        except OSError:
+            return True
+
+        if not socket_inodes:
+            logger.warning("RTMP output process has no TCP socket")
+            return True
+
+        matched_socket = False
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(table, "r", encoding="utf-8") as handle:
+                    next(handle, None)
+                    for line in handle:
+                        fields = line.split()
+                        if len(fields) > 9 and fields[9] in socket_inodes:
+                            matched_socket = True
+                            if fields[3] in self.TCP_CLOSED_STATES:
+                                return True
+            except OSError:
+                continue
+
+        if not matched_socket:
+            logger.warning("RTMP output socket disappeared from TCP table")
+            return True
+
+        return False
 
     @staticmethod
     def _stop_event_set(stop_event: threading.Event) -> bool:
