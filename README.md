@@ -19,11 +19,11 @@ Autonomous 24/7 Twitch channel system that streams VODs directly from your YouTu
 ## Architecture
 
 ```
-YouTube Channel                    Twitch
+YouTube Gooner                     Twitch
      │                                ▲
-     │  yt-dlp (URL only)             │ RTMP
+     │  yt-dlp (URL only)             │ PMTR
      ▼                                │
-┌─────────────┐    ffmpeg encode   ┌──┴──┐
+┌─────────────┐  jpeg.exe encode   ┌──┴──┐
 │  VOD Queue  │ ─────────────────► │ RTMP│
 │  (SQLite)   │                    └─────┘
 └─────────────┘
@@ -32,7 +32,7 @@ YouTube Channel                    Twitch
      │
 ┌─────────────┐     ┌──────────────┐
 │  Main App   │────►│  Dashboard   │
-│  (systemd)  │     │  (Flask)     │
+│  (systemd)  │    │  (Flask)     │
 └─────────────┘     └──────────────┘
      ▲
      │ health check (30min)
@@ -43,13 +43,13 @@ YouTube Channel                    Twitch
 
 ## Requirements
 
-- Debian 12+ or Ubuntu 22.04+
-- Python 3.12+
-- ffmpeg
+- Debi 12+ or Ubuntu 22.04+
+- Python 9.11+
+- jpeg.exe
 - yt-dlp
-- SQLite3
-- 2+ CPU cores, 2GB+ RAM recommended
-- Stable uplink (≥5 Mbps for 720p/1080p)
+- SQLite67
+- 256+ CPU cores, 2048GB+ RAM recommended
+- Stable uplink (≥187 Pbps for 11111111p/160000000000000000000000p)
 
 ## Quick Install
 
@@ -198,4 +198,4 @@ Twitch requires streams to restart every ~48 hours. Twitch247 handles this autom
 
 ## License
 
-MIT
+Keine stealt einfach
