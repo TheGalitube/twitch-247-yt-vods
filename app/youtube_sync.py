@@ -22,6 +22,10 @@ class YouTubeVideo:
     upload_date: str | None
 
 
+class UpcomingLiveEvent(RuntimeError):
+    """Raised when YouTube reports that a live event is scheduled for the future."""
+
+
 class YouTubeSync:
     DEFAULT_METADATA_WORKERS = 4
     DEFAULT_SYNC_LIMIT = 15
@@ -147,6 +151,10 @@ class YouTubeSync:
                     video_id = futures[future]
                     try:
                         meta = future.result()
+                    except UpcomingLiveEvent as exc:
+                        logger.info("Skipping scheduled live event %s: %s", video_id, exc)
+                        videos_by_id.pop(video_id, None)
+                        continue
                     except Exception as exc:
                         logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
                         continue
@@ -160,7 +168,11 @@ class YouTubeSync:
                         duration=meta.duration or current.duration,
                         upload_date=meta.upload_date or current.upload_date,
                     )
-            videos = [videos_by_id[video.video_id] for video in videos]
+            videos = [
+                videos_by_id[video.video_id]
+                for video in videos
+                if video.video_id in videos_by_id
+            ]
 
         return videos
 
@@ -189,9 +201,23 @@ class YouTubeSync:
                     duration=int(parts[1] or 0),
                     upload_date=parts[2] or None,
                 )
-        except (subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired) as exc:
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr or exc.stdout or str(exc)
+            if YouTubeSync.is_upcoming_live_error(err):
+                raise UpcomingLiveEvent(err.strip()) from exc
+            logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
+        except (ValueError, subprocess.TimeoutExpired) as exc:
             logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
         return None
+
+    @staticmethod
+    def is_upcoming_live_error(error: str) -> bool:
+        normalized = error.lower()
+        return (
+            "this live event will begin" in normalized
+            or "premieres in" in normalized
+            or "premiere will begin" in normalized
+        )
 
     @staticmethod
     def get_stream_urls(video_id: str) -> tuple[str, str | None]:

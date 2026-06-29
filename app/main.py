@@ -165,6 +165,16 @@ class Twitch247App:
     ) -> None:
         msg = error or "Unknown stream error"
         logger.error("Stream failed for %s: %s", video.video_id, msg)
+        if YouTubeSync.is_upcoming_live_error(msg):
+            logger.info(
+                "Skipping scheduled live event %s until it becomes playable",
+                video.video_id,
+            )
+            self.db.delete_video(video.video_id)
+            self.db.set_streaming(False)
+            self._reconnect_delay = self.RECONNECT_DELAY
+            return
+
         self._record_error(msg)
         self.notifier.error(f"{video.title}: {msg}")
         self.db.save_position(video.video_id, position)

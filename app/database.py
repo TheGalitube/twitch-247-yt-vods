@@ -119,6 +119,30 @@ class Database:
             ).fetchone()
             return self._row_to_video(row) if row else None
 
+    def delete_video(self, video_id: str) -> bool:
+        """Delete one video and clear playback state if it is currently selected."""
+        with self._connect() as conn:
+            current_row = conn.execute(
+                "SELECT current_video_id FROM playback_state WHERE id = 1"
+            ).fetchone()
+            if current_row and current_row["current_video_id"] == video_id:
+                conn.execute(
+                    """
+                    UPDATE playback_state
+                    SET current_video_id = NULL,
+                        current_position_seconds = 0,
+                        last_save_at = ?
+                    WHERE id = 1
+                    """,
+                    (utc_now(),),
+                )
+
+            deleted = conn.execute(
+                "DELETE FROM videos WHERE video_id = ?",
+                (video_id,),
+            ).rowcount
+            return bool(deleted)
+
     def get_video_index(self) -> dict[str, Video]:
         """Return all known videos keyed by YouTube video ID."""
         with self._connect() as conn:
