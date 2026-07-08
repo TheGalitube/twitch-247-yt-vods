@@ -34,6 +34,7 @@ class Config:
     video_bitrate: str
     maxrate: str
     bufsize: str
+    encoder_preset: str
     audio_bitrate: str
     dashboard_host: str
     dashboard_port: int
@@ -76,6 +77,7 @@ def load_config() -> Config:
         video_bitrate=os.getenv("VIDEO_BITRATE", "6000k"),
         maxrate=os.getenv("MAXRATE", "6000k"),
         bufsize=os.getenv("BUFSIZE", "12000k"),
+        encoder_preset=os.getenv("ENCODER_PRESET", "superfast"),
         audio_bitrate=os.getenv("AUDIO_BITRATE", "160k"),
         dashboard_host=os.getenv("DASHBOARD_HOST", "127.0.0.1"),
         dashboard_port=int(os.getenv("DASHBOARD_PORT", "8080")),

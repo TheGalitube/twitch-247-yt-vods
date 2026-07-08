@@ -31,6 +31,7 @@ class Streamer:
     OUTPUT_WIDTH = 1920
     OUTPUT_HEIGHT = 1080
     OUTPUT_FPS = 60
+    OUTPUT_RESTART_ATTEMPTS = 5
     OUTPUT_HEALTH_CHECK_INTERVAL = 5.0
     OUTPUT_STARTUP_GRACE_SECONDS = 30.0
     TCP_CLOSED_STATES = {
@@ -66,7 +67,7 @@ class Streamer:
     ) -> StreamResult:
         """Stream a YouTube video to Twitch starting at start_position."""
         current_position = start_position
-        max_output_retries = 2
+        max_output_retries = self.OUTPUT_RESTART_ATTEMPTS
 
         for attempt in range(1, max_output_retries + 1):
             seek_pos = max(0.0, current_position - max(0.0, seek_tolerance_seconds))
@@ -219,12 +220,16 @@ class Streamer:
                     time.sleep(0.5)
 
                 if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
+                    if output_dropped or stop_event.is_set():
                         proc.kill()
                         proc.wait()
+                    else:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
 
                 progress_thread.join(timeout=2)
                 returncode = proc.returncode or 0
@@ -560,7 +565,7 @@ class Streamer:
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                cfg.encoder_preset,
                 "-r",
                 str(self.OUTPUT_FPS),
                 "-b:v",
@@ -613,7 +618,7 @@ class Streamer:
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            cfg.encoder_preset,
             "-r",
             str(self.OUTPUT_FPS),
             "-b:v",

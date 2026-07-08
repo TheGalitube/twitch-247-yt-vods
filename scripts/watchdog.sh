@@ -25,6 +25,38 @@ fi
 
 mkdir -p "${APP_ROOT}/logs"
 
+has_healthy_rtmp_socket() {
+    local pid
+    for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
+        if ! ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ":1935"; then
+            continue
+        fi
+
+        if ss -tanp state close-wait 2>/dev/null | grep -q "pid=${pid},"; then
+            continue
+        fi
+
+        return 0
+    done
+
+    return 1
+}
+
+restart_streamer_after_grace() {
+    local reason="$1"
+    log "WARN: ${reason} — waiting 20s for streamer self-heal"
+    sleep 20
+
+    if has_healthy_rtmp_socket; then
+        log "INFO: RTMP connection recovered during grace period"
+        exit 0
+    fi
+
+    log "WARN: ${reason} persists — restarting streamer"
+    systemctl restart twitch247.service
+    exit 0
+}
+
 # Ensure main service is active
 if ! systemctl is-active --quiet twitch247.service; then
     log "ERROR: twitch247.service is not running — restarting"
@@ -65,29 +97,23 @@ if [[ -f "$DB" ]]; then
 fi
 
 # Verify ffmpeg is running (streamer should have an active ffmpeg child)
-FFMPEG_COUNT=$(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null | wc -l || echo 0)
+FFMPEG_COUNT=$( (pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true) | wc -l )
 if [[ "$FFMPEG_COUNT" -eq 0 ]]; then
     IS_STREAMING=$(sqlite3 "$DB" \
         "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
     if [[ "$IS_STREAMING" == "1" ]]; then
-        log "WARN: is_streaming=1 but no ffmpeg process — restarting streamer"
-        systemctl restart twitch247.service
-        exit 0
+        restart_streamer_after_grace "is_streaming=1 but no ffmpeg process"
     fi
 fi
 
 for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
     RTMP_SOCKET=$(ss -tanp 2>/dev/null | grep "pid=${pid}," | grep ":1935" || true)
     if [[ -z "$RTMP_SOCKET" ]]; then
-        log "WARN: RTMP ffmpeg pid ${pid} has no Twitch TCP connection — restarting streamer"
-        systemctl restart twitch247.service
-        exit 0
+        restart_streamer_after_grace "RTMP ffmpeg pid ${pid} has no Twitch TCP connection"
     fi
 
     if ss -tanp state close-wait 2>/dev/null | grep -q "pid=${pid},"; then
-        log "WARN: RTMP ffmpeg pid ${pid} has Twitch TCP connection in CLOSE-WAIT — restarting streamer"
-        systemctl restart twitch247.service
-        exit 0
+        restart_streamer_after_grace "RTMP ffmpeg pid ${pid} has Twitch TCP connection in CLOSE-WAIT"
     fi
 done
 

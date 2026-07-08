@@ -26,6 +26,10 @@ class UpcomingLiveEvent(RuntimeError):
     """Raised when YouTube reports that a live event is scheduled for the future."""
 
 
+class UnplayableYouTubeVideo(RuntimeError):
+    """Raised when YouTube refuses a video that should not block playback."""
+
+
 class YouTubeSync:
     DEFAULT_METADATA_WORKERS = 4
     DEFAULT_SYNC_LIMIT = 15
@@ -49,6 +53,17 @@ class YouTubeSync:
             0,
             int(os.getenv("YOUTUBE_SYNC_LIMIT", str(self.DEFAULT_SYNC_LIMIT))),
         )
+
+    @classmethod
+    def _yt_dlp_cmd(cls) -> list[str]:
+        cmd = [*cls.YT_DLP_BASE]
+        cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+        cookies_from_browser = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip()
+        if cookies_file:
+            cmd.extend(["--cookies", cookies_file])
+        if cookies_from_browser:
+            cmd.extend(["--cookies-from-browser", cookies_from_browser])
+        return cmd
 
     def sync(self) -> int:
         """Discover videos and update database. Returns count of new videos."""
@@ -151,8 +166,8 @@ class YouTubeSync:
                     video_id = futures[future]
                     try:
                         meta = future.result()
-                    except UpcomingLiveEvent as exc:
-                        logger.info("Skipping scheduled live event %s: %s", video_id, exc)
+                    except (UpcomingLiveEvent, UnplayableYouTubeVideo) as exc:
+                        logger.info("Skipping unavailable YouTube video %s: %s", video_id, exc)
                         videos_by_id.pop(video_id, None)
                         continue
                     except Exception as exc:
@@ -179,7 +194,7 @@ class YouTubeSync:
     def _fetch_video_metadata(self, video_id: str) -> YouTubeVideo | None:
         url = f"https://www.youtube.com/watch?v={video_id}"
         cmd = [
-            *self.YT_DLP_BASE,
+            *self._yt_dlp_cmd(),
             "--skip-download",
             "--print",
             "%(title)s\t%(duration)s\t%(upload_date)s",
@@ -205,6 +220,8 @@ class YouTubeSync:
             err = exc.stderr or exc.stdout or str(exc)
             if YouTubeSync.is_upcoming_live_error(err):
                 raise UpcomingLiveEvent(err.strip()) from exc
+            if YouTubeSync.is_youtube_auth_error(err):
+                raise UnplayableYouTubeVideo(err.strip()) from exc
             logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
         except (ValueError, subprocess.TimeoutExpired) as exc:
             logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
@@ -220,6 +237,14 @@ class YouTubeSync:
         )
 
     @staticmethod
+    def is_youtube_auth_error(error: str) -> bool:
+        normalized = error.lower()
+        return (
+            "sign in to confirm" in normalized
+            and "not a bot" in normalized
+        ) or "use --cookies-from-browser or --cookies" in normalized
+
+    @staticmethod
     def get_stream_urls(video_id: str) -> tuple[str, str | None]:
         """
         Resolve direct stream URL(s) via yt-dlp without downloading.
@@ -227,9 +252,7 @@ class YouTubeSync:
         """
         url = f"https://www.youtube.com/watch?v={video_id}"
         cmd = [
-            "yt-dlp",
-            "--no-warnings",
-            "--force-ipv4",
+            *YouTubeSync._yt_dlp_cmd(),
             "-g",
             "-f",
             "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
