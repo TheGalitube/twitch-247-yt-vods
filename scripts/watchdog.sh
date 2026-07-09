@@ -11,6 +11,7 @@ CONFIG="${APP_ROOT}/config/config.env"
 LOG="${APP_ROOT}/logs/watchdog.log"
 MAX_STREAM_HOURS=47
 DASHBOARD_PORT=8080
+TWITCH_GQL_CLIENT_ID="${TWITCH_GQL_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" | tee -a "$LOG"
@@ -54,6 +55,84 @@ restart_streamer_after_grace() {
 
     log "WARN: ${reason} persists — restarting streamer"
     systemctl restart twitch247.service
+    exit 0
+}
+
+twitch_live_state() {
+    local channel="${TWITCH_CHANNEL:-}"
+    if [[ -z "$channel" ]]; then
+        echo "unknown"
+        return 0
+    fi
+
+    local payload response
+    payload=$(python3 - "$channel" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "query": (
+        "query($login:String!){"
+        "user(login:$login){login stream{type createdAt}}"
+        "}"
+    ),
+    "variables": {"login": sys.argv[1].lstrip("@")},
+}))
+PY
+)
+
+    response=$(curl -fsS \
+        -H "Client-ID: ${TWITCH_GQL_CLIENT_ID}" \
+        -H "Content-Type: application/json" \
+        --data "$payload" \
+        "https://gql.twitch.tv/gql" 2>/dev/null) || {
+        echo "unknown"
+        return 0
+    }
+
+    TWITCH_RESPONSE="$response" python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    data = json.loads(os.environ["TWITCH_RESPONSE"])
+    stream = ((data.get("data") or {}).get("user") or {}).get("stream")
+except Exception:
+    print("unknown")
+    raise SystemExit
+
+if stream and stream.get("type") == "live":
+    print("live")
+else:
+    print("offline")
+PY
+}
+
+recover_rtmp_publish_after_grace() {
+    local reason="$1"
+    log "WARN: ${reason} — waiting 20s before RTMP publish recovery"
+    sleep 20
+
+    local state
+    state="$(twitch_live_state)"
+    if [[ "$state" == "live" ]]; then
+        log "INFO: Twitch channel is live after grace period"
+        exit 0
+    fi
+    if [[ "$state" == "unknown" ]]; then
+        log "WARN: Could not verify Twitch live state, leaving RTMP process running"
+        exit 0
+    fi
+
+    log "WARN: Twitch still reports channel offline — restarting RTMP output only"
+    for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    sleep 5
+    for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
     exit 0
 }
 
@@ -116,5 +195,16 @@ for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true)
         restart_streamer_after_grace "RTMP ffmpeg pid ${pid} has Twitch TCP connection in CLOSE-WAIT"
     fi
 done
+
+IS_STREAMING=$(sqlite3 "$DB" \
+    "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
+if [[ "$IS_STREAMING" == "1" ]]; then
+    TWITCH_STATE="$(twitch_live_state)"
+    if [[ "$TWITCH_STATE" == "offline" ]]; then
+        recover_rtmp_publish_after_grace "local RTMP socket is healthy but Twitch reports ${TWITCH_CHANNEL:-channel} offline"
+    elif [[ "$TWITCH_STATE" == "unknown" ]]; then
+        log "WARN: Twitch live-state check unavailable"
+    fi
+fi
 
 log "INFO: Health check passed"
