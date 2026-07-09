@@ -103,6 +103,12 @@ class Twitch247App:
         if video.played_status == "played":
             position = 0.0
 
+        if video.duration > 0 and position >= video.duration - 5:
+            self.db.set_video_status(video.video_id, "played", 0.0)
+            self.db.save_position(video.video_id, 0.0)
+            logger.info("Video already at end, marking completed: %s", video.title)
+            return
+
         self.db.set_video_status(video.video_id, "playing", position)
         reset_timer = self._first_start or self._reset_stream_timer_on_next_play
         self.db.set_streaming(True, video.video_id, reset_stream_timer=reset_timer)

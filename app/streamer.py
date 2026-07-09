@@ -128,6 +128,7 @@ class Streamer:
             wall_start = time.monotonic()
             last_save = 0.0
             last_position = seek_pos
+            saved_position = seek_pos
             position_lock = threading.Lock()
             stderr_tail: list[str] = []
             finished_naturally = False
@@ -201,6 +202,7 @@ class Streamer:
                         position = seek_pos + elapsed
                         if duration > 0:
                             position = min(position, float(duration))
+                        saved_position = position
                         on_position(position)
                         last_save = now
                         playback_logger.debug(
@@ -209,10 +211,10 @@ class Streamer:
                             duration,
                         )
 
-                    if duration > 0 and last_position >= duration - 2:
+                    if duration > 0 and max(last_position, saved_position) >= duration - 2:
                         playback_logger.info(
                             "Video near end (%.1fs), finishing",
-                            last_position,
+                            max(last_position, saved_position),
                         )
                         finished_naturally = True
                         break
@@ -233,7 +235,7 @@ class Streamer:
 
                 progress_thread.join(timeout=2)
                 returncode = proc.returncode or 0
-                final_position = get_position()
+                final_position = max(get_position(), saved_position)
 
                 if stop_event.is_set():
                     return StreamResult(success=True, final_position=final_position)
