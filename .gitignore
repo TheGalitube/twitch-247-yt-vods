@@ -7,9 +7,11 @@ venv/
 
 # Config secrets
 config/config.env
+config/youtube-cookies.txt
 
 # Runtime
 logs/*.log
+logs/*.json
 database/*.db
 database/*.db-*
 

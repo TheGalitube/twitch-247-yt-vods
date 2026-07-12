@@ -33,7 +33,11 @@ class Twitch247App:
         self.db = Database(config.db_path, schema_path)
         self.youtube = YouTubeSync(config.youtube_channel_url, self.db)
         self.streamer = Streamer(config)
-        self.notifier = Notifier(config.discord_webhook_url, config.twitch_channel)
+        self.notifier = Notifier(
+            config.discord_webhook_url,
+            config.twitch_channel,
+            config.log_dir / "discord_messages.json",
+        )
         self._stop_event = threading.Event()
         self._first_start = True
         self._reconnect_delay = self.RECONNECT_DELAY
@@ -171,10 +175,7 @@ class Twitch247App:
     ) -> None:
         msg = error or "Unknown stream error"
         logger.error("Stream failed for %s: %s", video.video_id, msg)
-        if (
-            YouTubeSync.is_upcoming_live_error(msg)
-            or YouTubeSync.is_youtube_auth_error(msg)
-        ):
+        if YouTubeSync.is_upcoming_live_error(msg):
             logger.info(
                 "Skipping unavailable YouTube video %s until next sync",
                 video.video_id,
@@ -182,6 +183,22 @@ class Twitch247App:
             self.db.delete_video(video.video_id)
             self.db.set_streaming(False)
             self._reconnect_delay = self.RECONNECT_DELAY
+            return
+
+        if YouTubeSync.is_youtube_auth_error(msg):
+            self._record_error(msg)
+            self.db.save_position(video.video_id, position)
+            self.db.set_streaming(False)
+            logger.warning(
+                "YouTube auth/bot check for %s; keeping video queued and retrying in %ds",
+                video.video_id,
+                self._reconnect_delay,
+            )
+            self._interruptible_sleep(self._reconnect_delay)
+            self._reconnect_delay = min(
+                self._reconnect_delay * 2,
+                self.MAX_RECONNECT_DELAY,
+            )
             return
 
         self._record_error(msg)

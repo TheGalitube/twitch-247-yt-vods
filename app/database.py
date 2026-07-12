@@ -198,7 +198,20 @@ class Database:
                 """
             ).fetchone()
             if row:
-                return self._row_to_video(row)
+                video = self._row_to_video(row)
+                if self._has_older_unplayed_video(video):
+                    conn.execute(
+                        """
+                        UPDATE videos
+                        SET played_status = 'unplayed',
+                            current_position_seconds = 0,
+                            updated_at = ?
+                        WHERE video_id = ?
+                        """,
+                        (utc_now(), video.video_id),
+                    )
+                else:
+                    return video
 
             row = conn.execute(
                 """
@@ -384,16 +397,17 @@ class Database:
                 played=played,
             )
 
-    def list_videos(self, limit: int = 50) -> list[Video]:
+    def list_videos(self, limit: int | None = 50) -> list[Video]:
         with self._connect() as conn:
-            rows = conn.execute(
-                """
+            query = """
                 SELECT * FROM videos
-                ORDER BY upload_date DESC NULLS LAST
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+                ORDER BY upload_date ASC NULLS LAST, discovered_at ASC
+                """
+            params: tuple[int, ...] = ()
+            if limit is not None:
+                query += "LIMIT ?"
+                params = (limit,)
+            rows = conn.execute(query, params).fetchall()
             return [self._row_to_video(r) for r in rows]
 
     def get_resume_video(self) -> Video | None:
@@ -402,8 +416,38 @@ class Database:
         if state.current_video_id:
             video = self.get_video(state.current_video_id)
             if video and video.played_status != "played":
+                older_unplayed = self._has_older_unplayed_video(video)
+                if older_unplayed:
+                    return None
                 return video
         return None
+
+    def _has_older_unplayed_video(self, video: Video) -> bool:
+        """Return True if queue order should prefer an older unplayed video."""
+        with self._connect() as conn:
+            if video.upload_date:
+                row = conn.execute(
+                    """
+                    SELECT 1 FROM videos
+                    WHERE played_status = 'unplayed'
+                      AND upload_date IS NOT NULL
+                      AND upload_date < ?
+                    LIMIT 1
+                    """,
+                    (video.upload_date,),
+                ).fetchone()
+                if row:
+                    return True
+
+            row = conn.execute(
+                """
+                SELECT 1 FROM videos
+                WHERE played_status = 'unplayed'
+                  AND (upload_date IS NULL OR upload_date = '')
+                LIMIT 1
+                """
+            ).fetchone()
+            return bool(row and video.upload_date)
 
     @staticmethod
     def _row_to_video(row: sqlite3.Row) -> Video:

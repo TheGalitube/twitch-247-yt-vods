@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 import requests
 
@@ -33,9 +36,21 @@ TITLES = {
 
 
 class Notifier:
-    def __init__(self, webhook_url: str | None, channel: str = "") -> None:
+    STATUS_EVENTS = {
+        NotificationEvent.STREAM_START,
+        NotificationEvent.VIDEO_CHANGE,
+        NotificationEvent.SERVICE_RESTART,
+    }
+
+    def __init__(
+        self,
+        webhook_url: str | None,
+        channel: str = "",
+        state_path: Path | None = None,
+    ) -> None:
         self.webhook_url = webhook_url
         self.channel = channel
+        self.state_path = state_path
 
     @property
     def enabled(self) -> bool:
@@ -44,11 +59,24 @@ class Notifier:
     def send(self, event: NotificationEvent, message: str, fields: dict[str, str] | None = None) -> None:
         if not self.enabled:
             return
+        if event in self.STATUS_EVENTS:
+            bucket = "status"
+        elif event == NotificationEvent.ERROR:
+            bucket = "error"
+        else:
+            bucket = event.value
 
         embed_fields = [
             {"name": k, "value": v, "inline": True}
             for k, v in (fields or {}).items()
         ]
+        embed_fields.append(
+            {
+                "name": "Last update",
+                "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "inline": True,
+            }
+        )
 
         payload = {
             "embeds": [
@@ -63,10 +91,76 @@ class Notifier:
         }
 
         try:
-            resp = requests.post(self.webhook_url, json=payload, timeout=10)
-            resp.raise_for_status()
+            self._upsert_message(bucket, payload)
+            if bucket == "status" and "error" not in self._load_state():
+                self._upsert_message("error", self._empty_error_payload())
         except requests.RequestException as exc:
             logger.warning("Discord notification failed: %s", exc)
+        except OSError as exc:
+            logger.warning("Discord notification state update failed: %s", exc)
+
+    def _upsert_message(self, bucket: str, payload: dict[str, object]) -> None:
+        message_id = self._load_state().get(bucket)
+        if message_id:
+            resp = requests.patch(
+                f"{self.webhook_url}/messages/{message_id}",
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                return
+
+            logger.info("Discord %s message %s no longer exists; creating a new one", bucket, message_id)
+
+        resp = requests.post(f"{self.webhook_url}?wait=true", json=payload, timeout=10)
+        resp.raise_for_status()
+        new_message_id = str(resp.json()["id"])
+        state = self._load_state()
+        state[bucket] = new_message_id
+        self._save_state(state)
+
+    def _load_state(self) -> dict[str, str]:
+        if not self.state_path or not self.state_path.is_file():
+            return {}
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Could not read Discord notification state: %s", exc)
+            return {}
+        return {
+            str(key): str(value)
+            for key, value in data.items()
+            if isinstance(value, str) and value
+        }
+
+    def _save_state(self, state: dict[str, str]) -> None:
+        if not self.state_path:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _empty_error_payload(self) -> dict[str, object]:
+        return {
+            "embeds": [
+                {
+                    "title": "Errors",
+                    "description": "No active errors.",
+                    "color": 0x00AA00,
+                    "fields": [
+                        {
+                            "name": "Last update",
+                            "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                            "inline": True,
+                        }
+                    ],
+                    "footer": {"text": f"Twitch247 • {self.channel}"},
+                }
+            ]
+        }
 
     def stream_start(self, video_title: str, video_id: str) -> None:
         self.send(

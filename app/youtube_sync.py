@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -34,7 +35,9 @@ class YouTubeSync:
     DEFAULT_METADATA_WORKERS = 4
     DEFAULT_SYNC_LIMIT = 15
     YT_DLP_BASE = [
-        "yt-dlp",
+        sys.executable,
+        "-m",
+        "yt_dlp",
         "--no-warnings",
         "--no-playlist",
         "--force-ipv4",
@@ -99,7 +102,7 @@ class YouTubeSync:
 
     def _fetch_channel_videos(self) -> list[YouTubeVideo]:
         cmd = [
-            *self.YT_DLP_BASE,
+            *self._yt_dlp_cmd(),
             "--flat-playlist",
             "--dump-single-json",
             self.channel_url,
@@ -166,9 +169,16 @@ class YouTubeSync:
                     video_id = futures[future]
                     try:
                         meta = future.result()
-                    except (UpcomingLiveEvent, UnplayableYouTubeVideo) as exc:
+                    except UpcomingLiveEvent as exc:
                         logger.info("Skipping unavailable YouTube video %s: %s", video_id, exc)
                         videos_by_id.pop(video_id, None)
+                        continue
+                    except UnplayableYouTubeVideo as exc:
+                        logger.warning(
+                            "Keeping YouTube video %s despite metadata auth error: %s",
+                            video_id,
+                            exc,
+                        )
                         continue
                     except Exception as exc:
                         logger.warning("Could not fetch metadata for %s: %s", video_id, exc)

@@ -190,7 +190,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>Video Queue (recent)</h2>
+    <h2>Video Queue ({{ videos|length }} total)</h2>
     <table>
       <thead>
         <tr><th>Title</th><th>Status</th><th>Duration</th><th>Upload</th></tr>
@@ -505,7 +505,7 @@ def create_app() -> Flask:
     def _build_context() -> dict:
         state = db.get_playback_state()
         stats = db.get_stats()
-        videos = db.list_videos(20)
+        videos = db.list_videos(None)
         user = _current_user()
 
         current_title = None
