@@ -12,6 +12,9 @@ LOG="${APP_ROOT}/logs/watchdog.log"
 MAX_STREAM_HOURS=47
 DASHBOARD_PORT=8080
 TWITCH_GQL_CLIENT_ID="${TWITCH_GQL_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}"
+PLAYBACK_FRESH_SECONDS="${PLAYBACK_FRESH_SECONDS:-120}"
+TWITCH_OFFLINE_RECOVERY_THRESHOLD="${TWITCH_OFFLINE_RECOVERY_THRESHOLD:-3}"
+TWITCH_OFFLINE_STATE_FILE="${APP_ROOT}/logs/watchdog-twitch-offline-count"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" | tee -a "$LOG"
@@ -109,6 +112,38 @@ else:
 PY
 }
 
+reset_twitch_offline_count() {
+    rm -f "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || true
+}
+
+increment_twitch_offline_count() {
+    local count=0
+
+    if [[ -f "$TWITCH_OFFLINE_STATE_FILE" ]]; then
+        count="$(cat "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || echo 0)"
+        [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    fi
+
+    count=$((count + 1))
+    echo "$count" > "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || true
+    echo "$count"
+}
+
+playback_recently_saved() {
+    [[ -f "$DB" ]] || return 1
+
+    local last_save epoch now age
+    last_save="$(sqlite3 "$DB" "SELECT COALESCE(last_save_at, '') FROM playback_state WHERE id=1;" 2>/dev/null || echo "")"
+    [[ -n "$last_save" ]] || return 1
+
+    epoch="$(date -d "${last_save} UTC" +%s 2>/dev/null || echo 0)"
+    [[ "$epoch" =~ ^[0-9]+$ && "$epoch" -gt 0 ]] || return 1
+
+    now="$(date +%s)"
+    age=$((now - epoch))
+    [[ "$age" -ge 0 && "$age" -le "$PLAYBACK_FRESH_SECONDS" ]]
+}
+
 recover_rtmp_publish_after_grace() {
     local reason="$1"
     log "WARN: ${reason} — waiting 20s before RTMP publish recovery"
@@ -117,12 +152,27 @@ recover_rtmp_publish_after_grace() {
     local state
     state="$(twitch_live_state)"
     if [[ "$state" == "live" ]]; then
+        reset_twitch_offline_count
         log "INFO: Twitch channel is live after grace period"
         exit 0
     fi
     if [[ "$state" == "unknown" ]]; then
         log "WARN: Could not verify Twitch live state, leaving RTMP process running"
         exit 0
+    fi
+
+    if has_healthy_rtmp_socket && playback_recently_saved; then
+        local offline_count
+        offline_count="$(increment_twitch_offline_count)"
+
+        if (( offline_count < TWITCH_OFFLINE_RECOVERY_THRESHOLD )); then
+            log "WARN: Twitch still reports channel offline, but local RTMP socket is healthy and playback state is fresh — skipping RTMP recycle (${offline_count}/${TWITCH_OFFLINE_RECOVERY_THRESHOLD})"
+            exit 0
+        fi
+
+        log "WARN: Twitch offline state persisted with healthy local RTMP (${offline_count}/${TWITCH_OFFLINE_RECOVERY_THRESHOLD}) — recycling RTMP output"
+    else
+        reset_twitch_offline_count
     fi
 
     log "WARN: Twitch still reports channel offline — restarting RTMP output only"
@@ -133,6 +183,7 @@ recover_rtmp_publish_after_grace() {
     for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
         kill -KILL "$pid" 2>/dev/null || true
     done
+    reset_twitch_offline_count
     exit 0
 }
 
@@ -202,6 +253,8 @@ if [[ "$IS_STREAMING" == "1" ]]; then
     TWITCH_STATE="$(twitch_live_state)"
     if [[ "$TWITCH_STATE" == "offline" ]]; then
         recover_rtmp_publish_after_grace "local RTMP socket is healthy but Twitch reports ${TWITCH_CHANNEL:-channel} offline"
+    elif [[ "$TWITCH_STATE" == "live" ]]; then
+        reset_twitch_offline_count
     elif [[ "$TWITCH_STATE" == "unknown" ]]; then
         log "WARN: Twitch live-state check unavailable"
     fi
