@@ -8,6 +8,7 @@ import stat
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -26,6 +27,17 @@ class StreamResult:
     error: str | None = None
 
 
+@dataclass
+class TcpSocketInfo:
+    table: str
+    local: str
+    remote: str
+    state: str
+    inode: str
+    tx_queue: str
+    rx_queue: str
+
+
 class Streamer:
     TIME_RE = re.compile(r"out_time_ms=(\d+)")
     OUTPUT_WIDTH = 1920
@@ -42,6 +54,19 @@ class Streamer:
         "09",  # LAST_ACK
         "0B",  # CLOSING
     }
+    TCP_STATE_NAMES = {
+        "01": "ESTABLISHED",
+        "02": "SYN_SENT",
+        "03": "SYN_RECV",
+        "04": "FIN_WAIT1",
+        "05": "FIN_WAIT2",
+        "06": "TIME_WAIT",
+        "07": "CLOSE",
+        "08": "CLOSE_WAIT",
+        "09": "LAST_ACK",
+        "0A": "LISTEN",
+        "0B": "CLOSING",
+    }
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -53,6 +78,8 @@ class Streamer:
         self._fifo_path = self.config.log_dir / "twitch247-rtmp.pipe"
         self._fifo_keepalive_fd: int | None = None
         self._output_started_at = 0.0
+        self._output_stderr_tail: deque[str] = deque(maxlen=20)
+        self._output_stderr_lock = threading.Lock()
 
     def stream_video(
         self,
@@ -64,6 +91,7 @@ class Streamer:
         duration: int,
         on_position: Callable[[float], None],
         stop_event: threading.Event,
+        on_stream_health: Callable[[str, dict[str, str]], None] | None = None,
     ) -> StreamResult:
         """Stream a YouTube video to Twitch starting at start_position."""
         current_position = start_position
@@ -180,7 +208,20 @@ class Streamer:
                         break
                     if self._output_dead.is_set():
                         output_dropped = True
-                        logger.warning("RTMP output went away, restarting stream")
+                        diagnostic = self._output_process_summary()
+                        logger.warning(
+                            "RTMP output went away, restarting stream (%s)",
+                            diagnostic,
+                        )
+                        self._notify_stream_health(
+                            on_stream_health,
+                            "RTMP output process exited unexpectedly.",
+                            video_id,
+                            current_position,
+                            attempt,
+                            max_output_retries,
+                            diagnostic,
+                        )
                         break
 
                     now = time.monotonic()
@@ -192,8 +233,19 @@ class Streamer:
                         if self._output_tcp_connection_closed():
                             output_dropped = True
                             self._output_dead.set()
+                            diagnostic = self._output_process_summary()
                             logger.warning(
-                                "RTMP output TCP connection closed, restarting stream"
+                                "RTMP output TCP connection closed, restarting stream (%s)",
+                                diagnostic,
+                            )
+                            self._notify_stream_health(
+                                on_stream_health,
+                                "RTMP TCP connection closed.",
+                                video_id,
+                                current_position,
+                                attempt,
+                                max_output_retries,
+                                diagnostic,
                             )
                             break
 
@@ -334,6 +386,8 @@ class Streamer:
             self._ensure_fifo()
             self._closing.clear()
             self._output_dead.clear()
+            with self._output_stderr_lock:
+                self._output_stderr_tail.clear()
             self._output_proc = subprocess.Popen(
                 self._build_output_ffmpeg_cmd(),
                 stderr=subprocess.PIPE,
@@ -353,7 +407,10 @@ class Streamer:
                     f"RTMP output exited with code {self._output_proc.returncode}"
                 )
 
-            playback_logger.info("Persistent RTMP output started")
+            playback_logger.info(
+                "Persistent RTMP output started (pid=%s)",
+                self._output_proc.pid,
+            )
             return str(self._fifo_path)
 
     def _stop_output_process(self) -> None:
@@ -418,15 +475,27 @@ class Streamer:
         for raw_line in proc.stderr:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if line:
+                with self._output_stderr_lock:
+                    self._output_stderr_tail.append(line)
                 logger.warning("RTMP output: %s", line)
 
         if self._output_proc is proc and not self._closing.is_set():
             self._output_dead.set()
-            logger.error("RTMP output process exited unexpectedly")
+            logger.error(
+                "RTMP output process exited unexpectedly (%s)",
+                self._output_process_summary(proc),
+            )
 
     def _output_tcp_connection_closed(self) -> bool:
         proc = self._output_proc
-        if not proc or proc.poll() is not None:
+        if not proc:
+            logger.warning("RTMP output process missing")
+            return True
+        if proc.poll() is not None:
+            logger.warning(
+                "RTMP output process already exited during TCP health check (%s)",
+                self._output_process_summary(proc),
+            )
             return True
         if (
             self._output_started_at
@@ -435,47 +504,184 @@ class Streamer:
         ):
             return False
 
-        socket_inodes: set[str] = set()
-        fd_dir = f"/proc/{proc.pid}/fd"
-        try:
-            for fd_name in os.listdir(fd_dir):
-                try:
-                    target = os.readlink(os.path.join(fd_dir, fd_name))
-                except OSError:
-                    continue
-                match = re.fullmatch(r"socket:\[(\d+)\]", target)
-                if match:
-                    socket_inodes.add(match.group(1))
-        except OSError:
+        socket_inodes = self._output_socket_inodes(proc)
+        if socket_inodes is None:
+            logger.warning(
+                "Could not inspect RTMP output process sockets (%s)",
+                self._output_process_summary(proc),
+            )
             return True
 
         if not socket_inodes:
-            logger.warning("RTMP output process has no TCP socket")
+            logger.warning(
+                "RTMP output process has no socket file descriptors (%s)",
+                self._output_process_summary(proc),
+            )
             return True
 
-        matched_socket = False
+        sockets = self._output_tcp_sockets(socket_inodes)
+        for socket_info in sockets:
+            if socket_info.state in self.TCP_CLOSED_STATES:
+                logger.warning(
+                    "RTMP output socket entered closed TCP state: %s (%s)",
+                    self._format_socket_info(socket_info),
+                    self._output_process_summary(proc),
+                )
+                return True
+
+        if not sockets:
+            logger.warning(
+                "RTMP output socket disappeared from TCP table (inodes=%s, %s)",
+                ",".join(sorted(socket_inodes)),
+                self._output_process_summary(proc),
+            )
+            return True
+
+        return False
+
+    def _output_socket_inodes(self, proc: subprocess.Popen[bytes]) -> set[str] | None:
+        socket_inodes: set[str] = set()
+        fd_dir = f"/proc/{proc.pid}/fd"
+        try:
+            fd_names = os.listdir(fd_dir)
+        except OSError:
+            return None
+
+        for fd_name in fd_names:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd_name))
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[(\d+)\]", target)
+            if match:
+                socket_inodes.add(match.group(1))
+
+        return socket_inodes
+
+    def _output_tcp_sockets(self, socket_inodes: set[str]) -> list[TcpSocketInfo]:
+        sockets: list[TcpSocketInfo] = []
         for table in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
                 with open(table, "r", encoding="utf-8") as handle:
                     next(handle, None)
                     for line in handle:
                         fields = line.split()
-                        if len(fields) > 9 and fields[9] in socket_inodes:
-                            matched_socket = True
-                            if fields[3] in self.TCP_CLOSED_STATES:
-                                return True
+                        if len(fields) <= 9 or fields[9] not in socket_inodes:
+                            continue
+
+                        tx_queue, _, rx_queue = fields[4].partition(":")
+                        sockets.append(
+                            TcpSocketInfo(
+                                table=table.rsplit("/", 1)[-1],
+                                local=self._decode_proc_net_address(fields[1], table),
+                                remote=self._decode_proc_net_address(fields[2], table),
+                                state=fields[3],
+                                inode=fields[9],
+                                tx_queue=tx_queue,
+                                rx_queue=rx_queue,
+                            )
+                        )
             except OSError:
                 continue
 
-        if not matched_socket:
-            logger.warning("RTMP output socket disappeared from TCP table")
-            return True
+        return sockets
 
-        return False
+    def _output_process_summary(
+        self,
+        proc: subprocess.Popen[bytes] | None = None,
+    ) -> str:
+        proc = proc or self._output_proc
+        if not proc:
+            return "pid=none"
+
+        returncode = proc.poll()
+        runtime = (
+            time.monotonic() - self._output_started_at
+            if self._output_started_at
+            else 0.0
+        )
+        socket_summary = self._current_output_socket_summary(proc)
+        stderr_tail = self._output_stderr_tail_summary()
+        return (
+            f"pid={proc.pid}, returncode={returncode}, runtime={runtime:.1f}s, "
+            f"sockets={socket_summary}, stderr_tail={stderr_tail}"
+        )
+
+    def _current_output_socket_summary(self, proc: subprocess.Popen[bytes]) -> str:
+        socket_inodes = self._output_socket_inodes(proc)
+        if socket_inodes is None:
+            return "uninspectable"
+        if not socket_inodes:
+            return "none"
+
+        sockets = self._output_tcp_sockets(socket_inodes)
+        if not sockets:
+            return f"not-in-tcp-table(inodes={','.join(sorted(socket_inodes))})"
+
+        return "; ".join(self._format_socket_info(socket) for socket in sockets)
+
+    def _output_stderr_tail_summary(self) -> str:
+        with self._output_stderr_lock:
+            tail = list(self._output_stderr_tail)[-5:]
+        if not tail:
+            return "none"
+        return " | ".join(tail)
+
+    def _format_socket_info(self, socket_info: TcpSocketInfo) -> str:
+        state = self.TCP_STATE_NAMES.get(socket_info.state, socket_info.state)
+        return (
+            f"{socket_info.table}:{socket_info.local}->{socket_info.remote} "
+            f"state={state} inode={socket_info.inode} "
+            f"tx={socket_info.tx_queue} rx={socket_info.rx_queue}"
+        )
+
+    @staticmethod
+    def _decode_proc_net_address(value: str, table: str) -> str:
+        address_hex, _, port_hex = value.partition(":")
+        port = int(port_hex, 16)
+
+        if table.endswith("tcp"):
+            octets = [
+                str(int(address_hex[index : index + 2], 16))
+                for index in range(6, -1, -2)
+            ]
+            return f"{'.'.join(octets)}:{port}"
+
+        if table.endswith("tcp6"):
+            groups = [
+                address_hex[index : index + 4]
+                for index in range(0, len(address_hex), 4)
+            ]
+            return f"{':'.join(groups)}:{port}"
+
+        return value
 
     @staticmethod
     def _stop_event_set(stop_event: threading.Event) -> bool:
         return stop_event.is_set()
+
+    @staticmethod
+    def _notify_stream_health(
+        callback: Callable[[str, dict[str, str]], None] | None,
+        message: str,
+        video_id: str,
+        position: float,
+        attempt: int,
+        max_attempts: int,
+        diagnostic: str,
+    ) -> None:
+        if not callback:
+            return
+
+        callback(
+            message,
+            {
+                "Video ID": video_id,
+                "Position": f"{position:.1f}s",
+                "Attempt": f"{attempt}/{max_attempts}",
+                "Diagnostic": diagnostic,
+            },
+        )
 
     def _build_output_ffmpeg_cmd(self) -> list[str]:
         return [

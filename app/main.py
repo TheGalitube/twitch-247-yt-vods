@@ -130,6 +130,9 @@ class Twitch247App:
         def on_position(pos: float) -> None:
             self.db.save_position(video.video_id, pos)
 
+        def on_stream_health(message: str, fields: dict[str, str]) -> None:
+            self.notifier.stream_health(message, fields)
+
         result = self.streamer.stream_video(
             video_id=video.video_id,
             title=video.title,
@@ -141,6 +144,7 @@ class Twitch247App:
             duration=video.duration,
             on_position=on_position,
             stop_event=self._stop_event,
+            on_stream_health=on_stream_health,
         )
 
         self._allow_restart_seek_tolerance = False

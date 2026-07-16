@@ -13,6 +13,7 @@ MAX_STREAM_HOURS=47
 DASHBOARD_PORT=8080
 TWITCH_GQL_CLIENT_ID="${TWITCH_GQL_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}"
 PLAYBACK_FRESH_SECONDS="${PLAYBACK_FRESH_SECONDS:-120}"
+RTMP_SELF_HEAL_GRACE_SECONDS="${RTMP_SELF_HEAL_GRACE_SECONDS:-45}"
 TWITCH_OFFLINE_RECOVERY_THRESHOLD="${TWITCH_OFFLINE_RECOVERY_THRESHOLD:-3}"
 TWITCH_OFFLINE_STATE_FILE="${APP_ROOT}/logs/watchdog-twitch-offline-count"
 
@@ -48,11 +49,16 @@ has_healthy_rtmp_socket() {
 
 restart_streamer_after_grace() {
     local reason="$1"
-    log "WARN: ${reason} — waiting 20s for streamer self-heal"
-    sleep 20
+    log "WARN: ${reason} — waiting ${RTMP_SELF_HEAL_GRACE_SECONDS}s for streamer self-heal"
+    sleep "$RTMP_SELF_HEAL_GRACE_SECONDS"
 
     if has_healthy_rtmp_socket; then
         log "INFO: RTMP connection recovered during grace period"
+        exit 0
+    fi
+
+    if playback_recently_saved; then
+        log "WARN: ${reason} persists, but playback state is fresh — leaving service running for app self-heal"
         exit 0
     fi
 

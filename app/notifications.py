@@ -16,6 +16,7 @@ logger = logging.getLogger("twitch247.notifications")
 class NotificationEvent(str, Enum):
     STREAM_START = "stream_start"
     VIDEO_CHANGE = "video_change"
+    STREAM_HEALTH = "stream_health"
     ERROR = "error"
     SERVICE_RESTART = "service_restart"
 
@@ -23,6 +24,7 @@ class NotificationEvent(str, Enum):
 COLORS = {
     NotificationEvent.STREAM_START: 0x9146FF,
     NotificationEvent.VIDEO_CHANGE: 0x00FF00,
+    NotificationEvent.STREAM_HEALTH: 0x3498DB,
     NotificationEvent.ERROR: 0xFF0000,
     NotificationEvent.SERVICE_RESTART: 0xFFA500,
 }
@@ -30,6 +32,7 @@ COLORS = {
 TITLES = {
     NotificationEvent.STREAM_START: "Stream Started",
     NotificationEvent.VIDEO_CHANGE: "Now Playing",
+    NotificationEvent.STREAM_HEALTH: "Stream Health",
     NotificationEvent.ERROR: "Error",
     NotificationEvent.SERVICE_RESTART: "Service Restarted",
 }
@@ -61,13 +64,15 @@ class Notifier:
             return
         if event in self.STATUS_EVENTS:
             bucket = "status"
+        elif event == NotificationEvent.STREAM_HEALTH:
+            bucket = "stream_health"
         elif event == NotificationEvent.ERROR:
             bucket = "error"
         else:
             bucket = event.value
 
         embed_fields = [
-            {"name": k, "value": v, "inline": True}
+            {"name": k, "value": self._truncate(v, 1024), "inline": True}
             for k, v in (fields or {}).items()
         ]
         embed_fields.append(
@@ -82,7 +87,7 @@ class Notifier:
             "embeds": [
                 {
                     "title": TITLES.get(event, event.value),
-                    "description": message,
+                    "description": self._truncate(message, 4096),
                     "color": COLORS.get(event, 0x808080),
                     "fields": embed_fields,
                     "footer": {"text": f"Twitch247 • {self.channel}"},
@@ -94,6 +99,8 @@ class Notifier:
             self._upsert_message(bucket, payload)
             if bucket == "status" and "error" not in self._load_state():
                 self._upsert_message("error", self._empty_error_payload())
+            if bucket == "status" and "stream_health" not in self._load_state():
+                self._upsert_message("stream_health", self._empty_stream_health_payload())
         except requests.RequestException as exc:
             logger.warning("Discord notification failed: %s", exc)
         except OSError as exc:
@@ -143,12 +150,37 @@ class Notifier:
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _truncate(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return value[: max(0, limit - 1)] + "…"
+
     def _empty_error_payload(self) -> dict[str, object]:
         return {
             "embeds": [
                 {
                     "title": "Errors",
                     "description": "No active errors.",
+                    "color": 0x00AA00,
+                    "fields": [
+                        {
+                            "name": "Last update",
+                            "value": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                            "inline": True,
+                        }
+                    ],
+                    "footer": {"text": f"Twitch247 • {self.channel}"},
+                }
+            ]
+        }
+
+    def _empty_stream_health_payload(self) -> dict[str, object]:
+        return {
+            "embeds": [
+                {
+                    "title": "Stream Health",
+                    "description": "No RTMP drops recorded since message setup.",
                     "color": 0x00AA00,
                     "fields": [
                         {
@@ -182,6 +214,9 @@ class Notifier:
 
     def error(self, message: str) -> None:
         self.send(NotificationEvent.ERROR, message)
+
+    def stream_health(self, message: str, fields: dict[str, str] | None = None) -> None:
+        self.send(NotificationEvent.STREAM_HEALTH, message, fields)
 
     def service_restart(self, video_title: str, position: float) -> None:
         self.send(
