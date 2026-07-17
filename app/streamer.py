@@ -42,7 +42,7 @@ class Streamer:
     TIME_RE = re.compile(r"out_time_ms=(\d+)")
     OUTPUT_WIDTH = 1920
     OUTPUT_HEIGHT = 1080
-    OUTPUT_FPS = 60
+    OUTPUT_FPS = 30
     OUTPUT_RESTART_ATTEMPTS = 5
     OUTPUT_HEALTH_CHECK_INTERVAL = 5.0
     OUTPUT_STARTUP_GRACE_SECONDS = 30.0
@@ -119,10 +119,12 @@ class Streamer:
             try:
                 video_url, audio_url = YouTubeSync.get_stream_urls(video_id)
             except subprocess.CalledProcessError as exc:
+                self._stop_output_process()
                 err = exc.stderr or str(exc)
                 logger.error("Failed to resolve stream URL for %s: %s", video_id, err)
                 return StreamResult(success=False, final_position=current_position, error=err)
             except RuntimeError as exc:
+                self._stop_output_process()
                 return StreamResult(success=False, final_position=current_position, error=str(exc))
 
             try:

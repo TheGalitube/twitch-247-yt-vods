@@ -191,18 +191,22 @@ class Twitch247App:
 
         if YouTubeSync.is_youtube_auth_error(msg):
             self._record_error(msg)
-            self.db.save_position(video.video_id, position)
+            self.db.set_video_status(video.video_id, "played", 0.0)
+            self.db.save_position(video.video_id, 0.0)
             self.db.set_streaming(False)
             logger.warning(
-                "YouTube auth/bot check for %s; keeping video queued and retrying in %ds",
+                "YouTube auth/bot check for %s; marking video played and continuing with next queued video",
                 video.video_id,
-                self._reconnect_delay,
             )
-            self._interruptible_sleep(self._reconnect_delay)
-            self._reconnect_delay = min(
-                self._reconnect_delay * 2,
-                self.MAX_RECONNECT_DELAY,
+            self.notifier.stream_health(
+                "Skipped YouTube video after auth/bot-check failure.",
+                {
+                    "Video": video.title,
+                    "ID": video.video_id,
+                    "Reason": "YouTube auth/bot check",
+                },
             )
+            self._reconnect_delay = self.RECONNECT_DELAY
             return
 
         self._record_error(msg)
