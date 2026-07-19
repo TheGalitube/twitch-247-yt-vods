@@ -96,6 +96,7 @@ class Streamer:
         """Stream a YouTube video to Twitch starting at start_position."""
         current_position = start_position
         max_output_retries = self.OUTPUT_RESTART_ATTEMPTS
+        output_recovery_pending = False
 
         for attempt in range(1, max_output_retries + 1):
             seek_pos = max(0.0, current_position - max(0.0, seek_tolerance_seconds))
@@ -163,6 +164,7 @@ class Streamer:
             stderr_tail: list[str] = []
             finished_naturally = False
             output_dropped = False
+            recovery_notified = False
             last_output_health_check = time.monotonic()
 
             def set_position(position: float) -> None:
@@ -211,6 +213,11 @@ class Streamer:
                     if self._output_dead.is_set():
                         output_dropped = True
                         diagnostic = self._output_process_summary()
+                        health_position = max(
+                            get_position(),
+                            saved_position,
+                            current_position,
+                        )
                         logger.warning(
                             "RTMP output went away, restarting stream (%s)",
                             diagnostic,
@@ -219,7 +226,7 @@ class Streamer:
                             on_stream_health,
                             "RTMP output process exited unexpectedly.",
                             video_id,
-                            current_position,
+                            health_position,
                             attempt,
                             max_output_retries,
                             diagnostic,
@@ -232,6 +239,11 @@ class Streamer:
                         >= self.OUTPUT_HEALTH_CHECK_INTERVAL
                     ):
                         last_output_health_check = now
+                        health_position = max(
+                            get_position(),
+                            saved_position,
+                            current_position,
+                        )
                         if self._output_tcp_connection_closed():
                             output_dropped = True
                             self._output_dead.set()
@@ -244,12 +256,30 @@ class Streamer:
                                 on_stream_health,
                                 "RTMP TCP connection closed.",
                                 video_id,
-                                current_position,
+                                health_position,
                                 attempt,
                                 max_output_retries,
                                 diagnostic,
                             )
                             break
+                        if (
+                            output_recovery_pending
+                            and not recovery_notified
+                            and self._output_started_at
+                            and now - self._output_started_at
+                            >= self.OUTPUT_STARTUP_GRACE_SECONDS
+                        ):
+                            self._notify_stream_health(
+                                on_stream_health,
+                                "RTMP connection recovered.",
+                                video_id,
+                                health_position,
+                                attempt,
+                                max_output_retries,
+                                self._output_process_summary(),
+                            )
+                            output_recovery_pending = False
+                            recovery_notified = True
 
                     if now - last_save >= self.config.save_interval:
                         elapsed = now - wall_start
@@ -325,6 +355,7 @@ class Streamer:
                         max_output_retries,
                     )
                     if output_failure:
+                        output_recovery_pending = True
                         self._stop_output_process()
                     time.sleep(2)
                     continue

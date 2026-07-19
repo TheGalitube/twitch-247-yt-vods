@@ -111,6 +111,7 @@ class Twitch247App:
             self.db.set_video_status(video.video_id, "played", 0.0)
             self.db.save_position(video.video_id, 0.0)
             logger.info("Video already at end, marking completed: %s", video.title)
+            self._resume_mode = False
             return
 
         self.db.set_video_status(video.video_id, "playing", position)
@@ -123,7 +124,18 @@ class Twitch247App:
             self.notifier.stream_start(video.title, video.video_id)
             self._first_start = False
         else:
-            self.notifier.video_change(video.title, video.video_id, position)
+            status_message = (
+                "Resumed playback after service restart."
+                if self._resume_mode
+                else "Switched to next video."
+            )
+            self.notifier.video_change(
+                video.title,
+                video.video_id,
+                position,
+                message=status_message,
+            )
+        self._resume_mode = False
 
         logger.info("Playing: %s (%s) from %.1fs", video.title, video.video_id, position)
 

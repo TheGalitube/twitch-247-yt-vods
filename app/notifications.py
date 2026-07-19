@@ -201,10 +201,16 @@ class Notifier:
             {"Video": video_title, "ID": video_id},
         )
 
-    def video_change(self, video_title: str, video_id: str, position: float) -> None:
+    def video_change(
+        self,
+        video_title: str,
+        video_id: str,
+        position: float,
+        message: str = "Switched to next video.",
+    ) -> None:
         self.send(
             NotificationEvent.VIDEO_CHANGE,
-            f"Switched to next video.",
+            message,
             {
                 "Video": video_title,
                 "ID": video_id,
