@@ -9,13 +9,16 @@ set -euo pipefail
 APP_ROOT="/opt/twitch247"
 CONFIG="${APP_ROOT}/config/config.env"
 LOG="${APP_ROOT}/logs/watchdog.log"
-MAX_STREAM_HOURS=47
+DB="${APP_ROOT}/database/twitch247.db"
+MAX_STREAM_HOURS="${MAX_STREAM_HOURS:-47}"
 DASHBOARD_PORT=8080
 TWITCH_GQL_CLIENT_ID="${TWITCH_GQL_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}"
 PLAYBACK_FRESH_SECONDS="${PLAYBACK_FRESH_SECONDS:-120}"
 RTMP_SELF_HEAL_GRACE_SECONDS="${RTMP_SELF_HEAL_GRACE_SECONDS:-45}"
 TWITCH_OFFLINE_RECOVERY_THRESHOLD="${TWITCH_OFFLINE_RECOVERY_THRESHOLD:-3}"
 TWITCH_OFFLINE_STATE_FILE="${APP_ROOT}/logs/watchdog-twitch-offline-count"
+TWITCH_STATE="unknown"
+TWITCH_STARTED_AT=""
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" | tee -a "$LOG"
@@ -67,14 +70,15 @@ restart_streamer_after_grace() {
     exit 0
 }
 
-twitch_live_state() {
+refresh_twitch_stream_info() {
     local channel="${TWITCH_CHANNEL:-}"
     if [[ -z "$channel" ]]; then
-        echo "unknown"
+        TWITCH_STATE="unknown"
+        TWITCH_STARTED_AT=""
         return 0
     fi
 
-    local payload response
+    local payload response parsed
     payload=$(python3 - "$channel" <<'PY'
 import json
 import sys
@@ -95,27 +99,66 @@ PY
         -H "Content-Type: application/json" \
         --data "$payload" \
         "https://gql.twitch.tv/gql" 2>/dev/null) || {
-        echo "unknown"
+        TWITCH_STATE="unknown"
+        TWITCH_STARTED_AT=""
         return 0
     }
 
-    TWITCH_RESPONSE="$response" python3 - <<'PY'
+    parsed=$(TWITCH_RESPONSE="$response" python3 - <<'PY'
 import json
 import os
-import sys
 
 try:
     data = json.loads(os.environ["TWITCH_RESPONSE"])
     stream = ((data.get("data") or {}).get("user") or {}).get("stream")
 except Exception:
-    print("unknown")
+    print("unknown|")
     raise SystemExit
 
 if stream and stream.get("type") == "live":
-    print("live")
+    print(f"live|{stream.get('createdAt') or ''}")
 else:
-    print("offline")
+    print("offline|")
 PY
+    )
+
+    IFS='|' read -r TWITCH_STATE TWITCH_STARTED_AT <<< "$parsed"
+    TWITCH_STATE="${TWITCH_STATE:-unknown}"
+}
+
+check_twitch_uptime_limit() {
+    if [[ "$TWITCH_STATE" == "unknown" ]]; then
+        log "WARN: Twitch broadcast uptime unavailable — skipping 47h restart this cycle"
+        return 0
+    fi
+
+    if [[ "$TWITCH_STATE" == "offline" ]]; then
+        log "INFO: Twitch channel is offline — skipping 47h restart and deferring to RTMP recovery"
+        return 0
+    fi
+
+    if [[ -z "$TWITCH_STARTED_AT" ]]; then
+        log "WARN: Twitch reports live without createdAt — skipping 47h restart this cycle"
+        return 0
+    fi
+
+    local start_epoch now_epoch elapsed_hours
+    start_epoch=$(date -d "$TWITCH_STARTED_AT" +%s 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    if [[ ! "$start_epoch" =~ ^[0-9]+$ ]] || (( start_epoch <= 0 || now_epoch < start_epoch )); then
+        log "WARN: Invalid Twitch broadcast createdAt '${TWITCH_STARTED_AT}' — skipping 47h restart this cycle"
+        return 0
+    fi
+
+    elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
+    if (( elapsed_hours >= MAX_STREAM_HOURS )); then
+        log "INFO: Twitch broadcast running ${elapsed_hours}h — proactive restart for 48h limit"
+        systemctl restart twitch247.service
+        log "INFO: Service restarted for 48h Twitch limit"
+        exit 0
+    fi
+
+    log "INFO: Twitch broadcast uptime ${elapsed_hours}h / ${MAX_STREAM_HOURS}h limit"
 }
 
 reset_twitch_offline_count() {
@@ -155,14 +198,13 @@ recover_rtmp_publish_after_grace() {
     log "WARN: ${reason} — waiting 20s before RTMP publish recovery"
     sleep 20
 
-    local state
-    state="$(twitch_live_state)"
-    if [[ "$state" == "live" ]]; then
+    refresh_twitch_stream_info
+    if [[ "$TWITCH_STATE" == "live" ]]; then
         reset_twitch_offline_count
         log "INFO: Twitch channel is live after grace period"
         exit 0
     fi
-    if [[ "$state" == "unknown" ]]; then
+    if [[ "$TWITCH_STATE" == "unknown" ]]; then
         log "WARN: Could not verify Twitch live state, leaving RTMP process running"
         exit 0
     fi
@@ -206,37 +248,16 @@ if ! curl -sf "http://127.0.0.1:${DASHBOARD_PORT}/health" > /dev/null 2>&1; then
     systemctl restart twitch247-dashboard.service 2>/dev/null || true
 fi
 
-# Proactive 48-hour Twitch restart
-# Read stream_started_at from SQLite
-DB="${APP_ROOT}/database/twitch247.db"
-if [[ -f "$DB" ]]; then
-    STREAM_STARTED=$(sqlite3 "$DB" \
-        "SELECT stream_started_at FROM playback_state WHERE id=1;" 2>/dev/null || echo "")
-
-    if [[ -n "$STREAM_STARTED" && "$STREAM_STARTED" != "NULL" ]]; then
-        START_EPOCH=$(date -d "$STREAM_STARTED UTC" +%s 2>/dev/null || echo 0)
-        NOW_EPOCH=$(date +%s)
-        ELAPSED_HOURS=$(( (NOW_EPOCH - START_EPOCH) / 3600 ))
-
-        if [[ "$ELAPSED_HOURS" -ge "$MAX_STREAM_HOURS" ]]; then
-            log "INFO: Stream running ${ELAPSED_HOURS}h — proactive restart for 48h limit"
-            # Reset stream_started_at so next cycle starts fresh timer
-            sqlite3 "$DB" \
-                "UPDATE playback_state SET stream_started_at = NULL WHERE id=1;" 2>/dev/null || true
-            systemctl restart twitch247.service
-            log "INFO: Service restarted for 48h Twitch limit"
-            exit 0
-        fi
-
-        log "INFO: Stream uptime ${ELAPSED_HOURS}h / ${MAX_STREAM_HOURS}h limit"
-    fi
+IS_STREAMING=$(sqlite3 "$DB" \
+    "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
+if [[ "$IS_STREAMING" == "1" ]]; then
+    refresh_twitch_stream_info
+    check_twitch_uptime_limit
 fi
 
 # Verify ffmpeg is running (streamer should have an active ffmpeg child)
 FFMPEG_COUNT=$( (pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true) | wc -l )
 if [[ "$FFMPEG_COUNT" -eq 0 ]]; then
-    IS_STREAMING=$(sqlite3 "$DB" \
-        "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
     if [[ "$IS_STREAMING" == "1" ]]; then
         restart_streamer_after_grace "is_streaming=1 but no ffmpeg process"
     fi
@@ -253,10 +274,7 @@ for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true)
     fi
 done
 
-IS_STREAMING=$(sqlite3 "$DB" \
-    "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
 if [[ "$IS_STREAMING" == "1" ]]; then
-    TWITCH_STATE="$(twitch_live_state)"
     if [[ "$TWITCH_STATE" == "offline" ]]; then
         recover_rtmp_publish_after_grace "local RTMP socket is healthy but Twitch reports ${TWITCH_CHANNEL:-channel} offline"
     elif [[ "$TWITCH_STATE" == "live" ]]; then
