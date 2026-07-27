@@ -3,8 +3,27 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+
+class _OnlyLogger(logging.Filter):
+    def __init__(self, logger_name: str) -> None:
+        super().__init__()
+        self.logger_name = logger_name
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name == self.logger_name
+
+
+class _ExcludeLogger(logging.Filter):
+    def __init__(self, logger_name: str) -> None:
+        super().__init__()
+        self.logger_name = logger_name
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.name != self.logger_name
 
 
 def setup_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
@@ -18,6 +37,8 @@ def setup_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
 
     root = logging.getLogger("twitch247")
     root.setLevel(level)
+    for existing_handler in root.handlers:
+        existing_handler.close()
     root.handlers.clear()
 
     console = logging.StreamHandler()
@@ -29,19 +50,23 @@ def setup_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
         ("error", "error.log"),
         ("playback", "playback.log"),
     ):
+        log_path = log_dir / filename
         handler = RotatingFileHandler(
-            log_dir / filename,
+            log_path,
             maxBytes=10 * 1024 * 1024,
             backupCount=5,
             encoding="utf-8",
         )
+        os.chmod(log_path, 0o640)
         handler.setFormatter(fmt)
         if name == "error":
             handler.setLevel(logging.ERROR)
         elif name == "playback":
             handler.setLevel(logging.INFO)
+            handler.addFilter(_OnlyLogger("twitch247.playback"))
         else:
             handler.setLevel(level)
+            handler.addFilter(_ExcludeLogger("twitch247.playback"))
         root.addHandler(handler)
 
     return root

@@ -160,6 +160,10 @@ class Database:
             ids_to_keep = set(keep_video_ids)
             if current_video_id:
                 ids_to_keep.add(current_video_id)
+            playing_rows = conn.execute(
+                "SELECT video_id FROM videos WHERE played_status = 'playing'"
+            ).fetchall()
+            ids_to_keep.update(row["video_id"] for row in playing_rows)
 
             if not ids_to_keep:
                 conn.execute(
@@ -204,7 +208,6 @@ class Database:
                         """
                         UPDATE videos
                         SET played_status = 'unplayed',
-                            current_position_seconds = 0,
                             updated_at = ?
                         WHERE video_id = ?
                         """,
@@ -423,31 +426,39 @@ class Database:
         return None
 
     def _has_older_unplayed_video(self, video: Video) -> bool:
-        """Return True if queue order should prefer an older unplayed video."""
+        """Return True when the first unplayed item sorts before this video."""
         with self._connect() as conn:
-            if video.upload_date:
-                row = conn.execute(
-                    """
-                    SELECT 1 FROM videos
-                    WHERE played_status = 'unplayed'
-                      AND upload_date IS NOT NULL
-                      AND upload_date < ?
-                    LIMIT 1
-                    """,
-                    (video.upload_date,),
-                ).fetchone()
-                if row:
-                    return True
-
-            row = conn.execute(
+            current = conn.execute(
                 """
-                SELECT 1 FROM videos
-                WHERE played_status = 'unplayed'
-                  AND (upload_date IS NULL OR upload_date = '')
-                LIMIT 1
-                """
+                SELECT upload_date, discovered_at
+                FROM videos
+                WHERE video_id = ?
+                """,
+                (video.video_id,),
             ).fetchone()
-            return bool(row and video.upload_date)
+            candidate = conn.execute(
+                """
+                SELECT upload_date, discovered_at
+                FROM videos
+                WHERE played_status = 'unplayed'
+                  AND video_id != ?
+                ORDER BY upload_date ASC NULLS LAST, discovered_at ASC
+                LIMIT 1
+                """,
+                (video.video_id,),
+            ).fetchone()
+            if not current or not candidate:
+                return False
+
+            def queue_key(row: sqlite3.Row) -> tuple[int, str, str]:
+                upload_date = row["upload_date"] or ""
+                return (
+                    1 if not upload_date else 0,
+                    upload_date,
+                    row["discovered_at"],
+                )
+
+            return queue_key(candidate) < queue_key(current)
 
     @staticmethod
     def _row_to_video(row: sqlite3.Row) -> Video:

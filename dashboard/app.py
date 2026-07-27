@@ -71,6 +71,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
     .status-live { color: var(--green); }
     .status-offline { color: var(--red); }
+    .status-unknown { color: var(--orange); }
     .progress-bar {
       background: var(--border);
       border-radius: 4px;
@@ -134,19 +135,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <div class="grid">
     <div class="card">
-      <h2>Stream Status</h2>
+      <h2>Twitch Status</h2>
       <p style="color:var(--muted);font-size:0.8rem;margin-bottom:0.35rem">Current Twitch live state</p>
-      <div class="value {% if is_streaming %}status-live{% else %}status-offline{% endif %}">
-        {% if is_streaming %}● LIVE{% else %}○ OFFLINE{% endif %}
+      <div class="value {{ twitch_status_class }}">
+        {{ twitch_status_label }}
       </div>
+      <p style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">Checked {{ twitch_checked_at or '—' }}</p>
     </div>
     <div class="card">
-      <h2>Stream Uptime</h2>
+      <h2>Broadcast Uptime</h2>
       <div class="value">{{ stream_uptime }}</div>
       <p style="color:var(--muted);font-size:0.8rem;margin-top:0.5rem">
-        Current Twitch session since the last service resume
+        Current Twitch broadcast session
       </p>
       <p style="color:var(--muted);font-size:0.8rem;margin-top:0.25rem">Service runtime: {{ service_uptime }}</p>
+    </div>
+    <div class="card">
+      <h2>Local Encoder</h2>
+      <p style="color:var(--muted);font-size:0.8rem;margin-bottom:0.35rem">Local playback/FFmpeg state</p>
+      <div class="value {% if local_streaming %}status-live{% else %}status-offline{% endif %}">
+        {% if local_streaming %}● RUNNING{% else %}○ STOPPED{% endif %}
+      </div>
     </div>
     <div class="card">
       <h2>Current Video</h2>
@@ -337,6 +346,12 @@ def create_app() -> Flask:
     flask_app.secret_key = config.dashboard_secret_key or "twitch247-dashboard-dev"
     flask_app.permanent_session_lifetime = timedelta(days=7)
     allowed_user_ids = {user.strip() for user in config.dashboard_allowed_discord_user_ids if user.strip()}
+    twitch_status_cache: dict[str, object] = {
+        "expires_at": datetime.min.replace(tzinfo=timezone.utc),
+        "state": "unknown",
+        "started_at": None,
+        "checked_at": None,
+    }
 
     auth_ready = all(
         [
@@ -487,9 +502,12 @@ def create_app() -> Flask:
         if not started_at:
             return "—"
         try:
-            start = datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
-            )
+            if started_at.endswith("Z") or "T" in started_at:
+                start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            else:
+                start = datetime.strptime(started_at, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
             delta = datetime.now(timezone.utc) - start
             days = delta.days
             hours, rem = divmod(delta.seconds, 3600)
@@ -502,11 +520,86 @@ def create_app() -> Flask:
         except ValueError:
             return started_at
 
+    def _format_checked_at(checked_at: datetime | None) -> str | None:
+        if not checked_at:
+            return None
+        return checked_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def _get_twitch_live_state() -> dict[str, object]:
+        now = datetime.now(timezone.utc)
+        if now < twitch_status_cache["expires_at"]:
+            return twitch_status_cache
+
+        state = "unknown"
+        started_at = None
+        channel = config.twitch_channel.strip().lstrip("@")
+
+        if channel:
+            payload = {
+                "query": (
+                    "query($login:String!){"
+                    "user(login:$login){login stream{type createdAt}}"
+                    "}"
+                ),
+                "variables": {"login": channel},
+            }
+            try:
+                response = requests.post(
+                    "https://gql.twitch.tv/gql",
+                    headers={
+                        "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=3,
+                )
+                response.raise_for_status()
+                stream = (
+                    ((response.json().get("data") or {}).get("user") or {}).get("stream")
+                )
+                if stream and stream.get("type") == "live":
+                    state = "live"
+                    started_at = stream.get("createdAt")
+                else:
+                    state = "offline"
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                state = "unknown"
+
+        twitch_status_cache.update(
+            {
+                "expires_at": now + timedelta(seconds=8),
+                "state": state,
+                "started_at": started_at,
+                "checked_at": now,
+            }
+        )
+        return twitch_status_cache
+
     def _build_context() -> dict:
         state = db.get_playback_state()
         stats = db.get_stats()
         videos = db.list_videos(None)
         user = _current_user()
+        twitch_state = _get_twitch_live_state()
+        twitch_live_state = str(twitch_state["state"])
+        twitch_started_at = (
+            str(twitch_state["started_at"]) if twitch_state["started_at"] else None
+        )
+        twitch_checked_at = (
+            twitch_state["checked_at"]
+            if isinstance(twitch_state["checked_at"], datetime)
+            else None
+        )
+
+        if twitch_live_state == "live":
+            twitch_status_label = "● LIVE"
+            twitch_status_class = "status-live"
+        elif twitch_live_state == "offline":
+            twitch_status_label = "○ OFFLINE"
+            twitch_status_class = "status-offline"
+        else:
+            twitch_status_label = "? UNKNOWN"
+            twitch_status_class = "status-unknown"
 
         current_title = None
         current_duration = 0
@@ -525,8 +618,13 @@ def create_app() -> Flask:
             "channel": config.twitch_channel,
             "authenticated_user": user,
             "auth_enabled": auth_ready,
-            "is_streaming": state.is_streaming,
-            "stream_uptime": _format_uptime(state.stream_started_at if state.is_streaming else None),
+            "is_streaming": twitch_live_state == "live",
+            "local_streaming": state.is_streaming,
+            "twitch_live_state": twitch_live_state,
+            "twitch_status_label": twitch_status_label,
+            "twitch_status_class": twitch_status_class,
+            "twitch_checked_at": _format_checked_at(twitch_checked_at),
+            "stream_uptime": _format_uptime(twitch_started_at if twitch_live_state == "live" else None),
             "service_uptime": _format_uptime(state.uptime_started_at),
             "current_title": current_title,
             "current_video_id": state.current_video_id,
@@ -660,6 +758,9 @@ def create_app() -> Flask:
         ctx = _build_context()
         return jsonify({
             "streaming": ctx["is_streaming"],
+            "twitch_live_state": ctx["twitch_live_state"],
+            "twitch_checked_at": ctx["twitch_checked_at"],
+            "local_streaming": ctx["local_streaming"],
             "uptime": ctx["stream_uptime"],
             "service_uptime": ctx["service_uptime"],
             "current_video_id": ctx["current_video_id"],

@@ -8,43 +8,66 @@ set -euo pipefail
 
 APP_ROOT="/opt/twitch247"
 CONFIG="${APP_ROOT}/config/config.env"
-LOG="${APP_ROOT}/logs/watchdog.log"
-DB="${APP_ROOT}/database/twitch247.db"
 MAX_STREAM_HOURS="${MAX_STREAM_HOURS:-47}"
-DASHBOARD_PORT=8080
+UPTIME_RESTART_COOLDOWN_SECONDS="${UPTIME_RESTART_COOLDOWN_SECONDS:-900}"
+UPTIME_RESTART_STATE_FILE="/run/twitch247-watchdog-uptime-restart"
+DASHBOARD_PORT="${DASHBOARD_PORT:-}"
 TWITCH_GQL_CLIENT_ID="${TWITCH_GQL_CLIENT_ID:-kimne78kx3ncx6brgo4mv6wki5h1ko}"
-PLAYBACK_FRESH_SECONDS="${PLAYBACK_FRESH_SECONDS:-120}"
 RTMP_SELF_HEAL_GRACE_SECONDS="${RTMP_SELF_HEAL_GRACE_SECONDS:-45}"
-TWITCH_OFFLINE_RECOVERY_THRESHOLD="${TWITCH_OFFLINE_RECOVERY_THRESHOLD:-3}"
-TWITCH_OFFLINE_STATE_FILE="${APP_ROOT}/logs/watchdog-twitch-offline-count"
+TWITCH_OFFLINE_CONFIRM_SECONDS="${TWITCH_OFFLINE_CONFIRM_SECONDS:-20}"
+RTMP_RECOVERY_TIMEOUT_SECONDS="${RTMP_RECOVERY_TIMEOUT_SECONDS:-40}"
+RTMP_RECYCLE_COOLDOWN_SECONDS="${RTMP_RECYCLE_COOLDOWN_SECONDS:-300}"
+RTMP_RECYCLE_STATE_FILE="/run/twitch247-watchdog-rtmp-recycle"
 TWITCH_STATE="unknown"
 TWITCH_STARTED_AT=""
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*" | tee -a "$LOG"
+read_config_value() {
+    local key="$1"
+    [[ -f "$CONFIG" ]] || return 0
+    awk -v wanted="$key" '
+        $0 ~ "^[[:space:]]*" wanted "[[:space:]]*=" {
+            sub("^[[:space:]]*" wanted "[[:space:]]*=[[:space:]]*", "")
+            sub("[[:space:]]+$", "")
+            if (($0 ~ /^".*"$/) || ($0 ~ /^\047.*\047$/)) {
+                $0 = substr($0, 2, length($0) - 2)
+            }
+            print
+            exit
+        }
+    ' "$CONFIG"
 }
 
-# Load dashboard port from config if available
-if [[ -f "$CONFIG" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONFIG" 2>/dev/null || true
-    DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+# Parse only the non-secret values this script needs. Never source a config
+# file from this root-owned watchdog.
+TWITCH_CHANNEL="${TWITCH_CHANNEL:-$(read_config_value TWITCH_CHANNEL)}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-$(read_config_value DASHBOARD_PORT)}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+DB="${DB_PATH:-$(read_config_value DB_PATH)}"
+DB="${DB:-${APP_ROOT}/database/twitch247.db}"
+LOG_DIR="${LOG_DIR:-$(read_config_value LOG_DIR)}"
+LOG_DIR="${LOG_DIR:-${APP_ROOT}/logs}"
+
+# Prevent a manual run from racing the systemd timer.
+exec 9>"/run/twitch247-watchdog.lock"
+flock -n 9 || exit 0
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [watchdog] $*"
+}
+
+if [[ ! "$DASHBOARD_PORT" =~ ^[0-9]{1,5}$ ]] \
+    || (( 10#$DASHBOARD_PORT < 1 || 10#$DASHBOARD_PORT > 65535 )); then
+    log "WARN: Invalid dashboard port in configuration; using 8080"
+    DASHBOARD_PORT=8080
 fi
 
-mkdir -p "${APP_ROOT}/logs"
-
 has_healthy_rtmp_socket() {
-    local pid
+    local pid sockets
+    sockets="$(ss -Htanp state established 2>/dev/null || true)"
     for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
-        if ! ss -tanp 2>/dev/null | grep "pid=${pid}," | grep -q ":1935"; then
-            continue
+        if grep "pid=${pid}," <<< "$sockets" | grep -q ":1935"; then
+            return 0
         fi
-
-        if ss -tanp state close-wait 2>/dev/null | grep -q "pid=${pid},"; then
-            continue
-        fi
-
-        return 0
     done
 
     return 1
@@ -57,11 +80,6 @@ restart_streamer_after_grace() {
 
     if has_healthy_rtmp_socket; then
         log "INFO: RTMP connection recovered during grace period"
-        exit 0
-    fi
-
-    if playback_recently_saved; then
-        log "WARN: ${reason} persists, but playback state is fresh — leaving service running for app self-heal"
         exit 0
     fi
 
@@ -95,6 +113,10 @@ PY
 )
 
     response=$(curl -fsS \
+        --connect-timeout 3 \
+        --max-time 8 \
+        --retry 1 \
+        --retry-delay 1 \
         -H "Client-ID: ${TWITCH_GQL_CLIENT_ID}" \
         -H "Content-Type: application/json" \
         --data "$payload" \
@@ -110,15 +132,25 @@ import os
 
 try:
     data = json.loads(os.environ["TWITCH_RESPONSE"])
-    stream = ((data.get("data") or {}).get("user") or {}).get("stream")
+    if not isinstance(data, dict) or data.get("errors"):
+        raise ValueError("GraphQL error response")
+    payload = data.get("data")
+    if not isinstance(payload, dict) or "user" not in payload:
+        raise ValueError("GraphQL data.user missing")
+    user = payload["user"]
+    if not isinstance(user, dict) or "stream" not in user:
+        raise ValueError("GraphQL user.stream missing")
+    stream = user["stream"]
 except Exception:
     print("unknown|")
     raise SystemExit
 
-if stream and stream.get("type") == "live":
+if isinstance(stream, dict) and stream.get("type") == "live":
     print(f"live|{stream.get('createdAt') or ''}")
-else:
+elif stream is None:
     print("offline|")
+else:
+    print("unknown|")
 PY
     )
 
@@ -142,7 +174,7 @@ check_twitch_uptime_limit() {
         return 0
     fi
 
-    local start_epoch now_epoch elapsed_hours
+    local start_epoch now_epoch elapsed_hours last_restart
     start_epoch=$(date -d "$TWITCH_STARTED_AT" +%s 2>/dev/null || echo 0)
     now_epoch=$(date +%s)
     if [[ ! "$start_epoch" =~ ^[0-9]+$ ]] || (( start_epoch <= 0 || now_epoch < start_epoch )); then
@@ -152,6 +184,14 @@ check_twitch_uptime_limit() {
 
     elapsed_hours=$(( (now_epoch - start_epoch) / 3600 ))
     if (( elapsed_hours >= MAX_STREAM_HOURS )); then
+        last_restart="$(cat "$UPTIME_RESTART_STATE_FILE" 2>/dev/null || echo 0)"
+        [[ "$last_restart" =~ ^[0-9]+$ ]] || last_restart=0
+        if (( now_epoch - last_restart < UPTIME_RESTART_COOLDOWN_SECONDS )); then
+            log "WARN: Twitch still reports ${elapsed_hours}h, but 47h restart cooldown is active"
+            return 0
+        fi
+        printf '%s\n' "$now_epoch" > "$UPTIME_RESTART_STATE_FILE"
+        chmod 600 "$UPTIME_RESTART_STATE_FILE"
         log "INFO: Twitch broadcast running ${elapsed_hours}h — proactive restart for 48h limit"
         systemctl restart twitch247.service
         log "INFO: Service restarted for 48h Twitch limit"
@@ -161,46 +201,88 @@ check_twitch_uptime_limit() {
     log "INFO: Twitch broadcast uptime ${elapsed_hours}h / ${MAX_STREAM_HOURS}h limit"
 }
 
-reset_twitch_offline_count() {
-    rm -f "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || true
+clear_legacy_offline_state() {
+    rm -f "${LOG_DIR}/watchdog-twitch-offline-count" 2>/dev/null || true
 }
 
-increment_twitch_offline_count() {
-    local count=0
+recycle_rtmp_output() {
+    local -a targets=()
+    local pid start_time target expected_start current_start
 
-    if [[ -f "$TWITCH_OFFLINE_STATE_FILE" ]]; then
-        count="$(cat "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || echo 0)"
-        [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    while read -r pid; do
+        [[ -n "$pid" && -r "/proc/${pid}/stat" ]] || continue
+        start_time="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)"
+        [[ "$start_time" =~ ^[0-9]+$ ]] || continue
+        targets+=("${pid}:${start_time}")
+    done < <(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true)
+
+    if (( ${#targets[@]} == 0 )); then
+        log "WARN: No RTMP publisher found to recycle — restarting service"
+        systemctl restart twitch247.service
+        return 1
     fi
 
-    count=$((count + 1))
-    echo "$count" > "$TWITCH_OFFLINE_STATE_FILE" 2>/dev/null || true
-    echo "$count"
-}
+    for target in "${targets[@]}"; do
+        pid="${target%%:*}"
+        kill -TERM "$pid" 2>/dev/null || true
+    done
 
-playback_recently_saved() {
-    [[ -f "$DB" ]] || return 1
+    sleep 5
 
-    local last_save epoch now age
-    last_save="$(sqlite3 "$DB" "SELECT COALESCE(last_save_at, '') FROM playback_state WHERE id=1;" 2>/dev/null || echo "")"
-    [[ -n "$last_save" ]] || return 1
+    # Only force-kill the exact original processes. A replacement publisher may
+    # already have started and must never be caught by this second pass.
+    for target in "${targets[@]}"; do
+        pid="${target%%:*}"
+        expected_start="${target##*:}"
+        [[ -r "/proc/${pid}/stat" ]] || continue
+        current_start="$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null || true)"
+        if [[ "$current_start" == "$expected_start" ]] \
+            && tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null \
+                | grep -q "ffmpeg.*live.twitch.tv"; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
 
-    epoch="$(date -d "${last_save} UTC" +%s 2>/dev/null || echo 0)"
-    [[ "$epoch" =~ ^[0-9]+$ && "$epoch" -gt 0 ]] || return 1
+    local waited=0 recovered_socket=0
+    while (( waited < RTMP_RECOVERY_TIMEOUT_SECONDS )); do
+        sleep 5
+        waited=$((waited + 5))
+        if has_healthy_rtmp_socket; then
+            recovered_socket=1
+            break
+        fi
+    done
 
-    now="$(date +%s)"
-    age=$((now - epoch))
-    [[ "$age" -ge 0 && "$age" -le "$PLAYBACK_FRESH_SECONDS" ]]
+    if (( recovered_socket == 1 )); then
+        # Give Twitch a short moment to expose the new publish session, then
+        # perform one bounded API verification.
+        sleep 5
+        refresh_twitch_stream_info
+        if [[ "$TWITCH_STATE" == "live" ]]; then
+            log "INFO: RTMP publisher recovered and Twitch is live"
+            return 0
+        fi
+        if [[ "$TWITCH_STATE" == "unknown" ]]; then
+            log "INFO: Replacement RTMP socket is established; Twitch API status unavailable"
+            return 0
+        fi
+        log "WARN: Replacement RTMP socket is established; Twitch live state will be rechecked next cycle"
+        return 0
+    fi
+
+    log "WARN: RTMP-only recovery did not establish a new publisher — restarting service"
+    systemctl restart twitch247.service
+    return 1
 }
 
 recover_rtmp_publish_after_grace() {
     local reason="$1"
-    log "WARN: ${reason} — waiting 20s before RTMP publish recovery"
-    sleep 20
+    local now_epoch last_recycle
+    log "WARN: ${reason} — confirming for ${TWITCH_OFFLINE_CONFIRM_SECONDS}s"
+    sleep "$TWITCH_OFFLINE_CONFIRM_SECONDS"
 
     refresh_twitch_stream_info
     if [[ "$TWITCH_STATE" == "live" ]]; then
-        reset_twitch_offline_count
         log "INFO: Twitch channel is live after grace period"
         exit 0
     fi
@@ -209,29 +291,19 @@ recover_rtmp_publish_after_grace() {
         exit 0
     fi
 
-    if has_healthy_rtmp_socket && playback_recently_saved; then
-        local offline_count
-        offline_count="$(increment_twitch_offline_count)"
-
-        if (( offline_count < TWITCH_OFFLINE_RECOVERY_THRESHOLD )); then
-            log "WARN: Twitch still reports channel offline, but local RTMP socket is healthy and playback state is fresh — skipping RTMP recycle (${offline_count}/${TWITCH_OFFLINE_RECOVERY_THRESHOLD})"
-            exit 0
-        fi
-
-        log "WARN: Twitch offline state persisted with healthy local RTMP (${offline_count}/${TWITCH_OFFLINE_RECOVERY_THRESHOLD}) — recycling RTMP output"
-    else
-        reset_twitch_offline_count
+    now_epoch="$(date +%s)"
+    last_recycle="$(cat "$RTMP_RECYCLE_STATE_FILE" 2>/dev/null || echo 0)"
+    [[ "$last_recycle" =~ ^[0-9]+$ ]] || last_recycle=0
+    if (( now_epoch - last_recycle < RTMP_RECYCLE_COOLDOWN_SECONDS )); then
+        log "WARN: Twitch is still offline, but the RTMP recycle cooldown is active"
+        exit 0
     fi
 
-    log "WARN: Twitch still reports channel offline — restarting RTMP output only"
-    for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
-        kill -TERM "$pid" 2>/dev/null || true
-    done
-    sleep 5
-    for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
-        kill -KILL "$pid" 2>/dev/null || true
-    done
-    reset_twitch_offline_count
+    printf '%s\n' "$now_epoch" > "$RTMP_RECYCLE_STATE_FILE"
+    chmod 600 "$RTMP_RECYCLE_STATE_FILE"
+    log "WARN: Twitch is still offline after confirmation — recycling RTMP output"
+    recycle_rtmp_output || true
+    clear_legacy_offline_state
     exit 0
 }
 
@@ -243,12 +315,15 @@ if ! systemctl is-active --quiet twitch247.service; then
 fi
 
 # Check dashboard health
-if ! curl -sf "http://127.0.0.1:${DASHBOARD_PORT}/health" > /dev/null 2>&1; then
+if ! curl -sf \
+    --connect-timeout 2 \
+    --max-time 5 \
+    "http://127.0.0.1:${DASHBOARD_PORT}/health" > /dev/null 2>&1; then
     log "WARN: Dashboard not responding — restarting dashboard"
     systemctl restart twitch247-dashboard.service 2>/dev/null || true
 fi
 
-IS_STREAMING=$(sqlite3 "$DB" \
+IS_STREAMING=$(runuser -u twitch247 -- sqlite3 -readonly "$DB" \
     "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
 if [[ "$IS_STREAMING" == "1" ]]; then
     refresh_twitch_stream_info
@@ -261,27 +336,24 @@ if [[ "$FFMPEG_COUNT" -eq 0 ]]; then
     if [[ "$IS_STREAMING" == "1" ]]; then
         restart_streamer_after_grace "is_streaming=1 but no ffmpeg process"
     fi
+elif ! has_healthy_rtmp_socket; then
+    if [[ "$IS_STREAMING" == "1" ]]; then
+        restart_streamer_after_grace \
+            "RTMP publisher has no established Twitch TCP connection"
+    fi
 fi
-
-for pid in $(pgrep -u twitch247 -f "ffmpeg.*live.twitch.tv" 2>/dev/null || true); do
-    RTMP_SOCKET=$(ss -tanp 2>/dev/null | grep "pid=${pid}," | grep ":1935" || true)
-    if [[ -z "$RTMP_SOCKET" ]]; then
-        restart_streamer_after_grace "RTMP ffmpeg pid ${pid} has no Twitch TCP connection"
-    fi
-
-    if ss -tanp state close-wait 2>/dev/null | grep -q "pid=${pid},"; then
-        restart_streamer_after_grace "RTMP ffmpeg pid ${pid} has Twitch TCP connection in CLOSE-WAIT"
-    fi
-done
 
 if [[ "$IS_STREAMING" == "1" ]]; then
     if [[ "$TWITCH_STATE" == "offline" ]]; then
         recover_rtmp_publish_after_grace "local RTMP socket is healthy but Twitch reports ${TWITCH_CHANNEL:-channel} offline"
     elif [[ "$TWITCH_STATE" == "live" ]]; then
-        reset_twitch_offline_count
+        clear_legacy_offline_state
     elif [[ "$TWITCH_STATE" == "unknown" ]]; then
+        clear_legacy_offline_state
         log "WARN: Twitch live-state check unavailable"
     fi
+else
+    clear_legacy_offline_state
 fi
 
 log "INFO: Health check passed"

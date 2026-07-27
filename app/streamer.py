@@ -25,6 +25,7 @@ class StreamResult:
     success: bool
     final_position: float
     error: str | None = None
+    completed: bool = False
 
 
 @dataclass
@@ -40,12 +41,18 @@ class TcpSocketInfo:
 
 class Streamer:
     TIME_RE = re.compile(r"out_time_ms=(\d+)")
+    RTMP_URL_RE = re.compile(r"(rtmps?://[^/\s]+/app/)[^\s]+", re.IGNORECASE)
+    HTTP_URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
     OUTPUT_WIDTH = 1920
     OUTPUT_HEIGHT = 1080
     OUTPUT_FPS = 30
     OUTPUT_RESTART_ATTEMPTS = 5
     OUTPUT_HEALTH_CHECK_INTERVAL = 5.0
     OUTPUT_STARTUP_GRACE_SECONDS = 30.0
+    OUTPUT_UNHEALTHY_CHECKS = 2
+    OUTPUT_MAX_TIMELINE_SECONDS = 20 * 60 * 60
+    INPUT_STARTUP_TIMEOUT_SECONDS = 90.0
+    INPUT_STALL_TIMEOUT_SECONDS = 60.0
     TCP_CLOSED_STATES = {
         "04",  # FIN_WAIT1
         "05",  # FIN_WAIT2
@@ -78,6 +85,8 @@ class Streamer:
         self._fifo_path = self.config.log_dir / "twitch247-rtmp.pipe"
         self._fifo_keepalive_fd: int | None = None
         self._output_started_at = 0.0
+        self._output_generation = 0
+        self._output_timeline_seconds = 0.0
         self._output_stderr_tail: deque[str] = deque(maxlen=20)
         self._output_stderr_lock = threading.Lock()
 
@@ -86,7 +95,6 @@ class Streamer:
         video_id: str,
         title: str,
         start_position: float,
-        stream_offset_seconds: float,
         seek_tolerance_seconds: float,
         duration: int,
         on_position: Callable[[float], None],
@@ -118,10 +126,22 @@ class Streamer:
                 )
 
             try:
-                video_url, audio_url = YouTubeSync.get_stream_urls(video_id)
-            except subprocess.CalledProcessError as exc:
+                video_url, audio_url = YouTubeSync.get_stream_urls(
+                    video_id,
+                    stop_event=stop_event,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                OSError,
+            ) as exc:
+                err = self._subprocess_error_text(exc)
                 self._stop_output_process()
-                err = exc.stderr or str(exc)
+                if stop_event.is_set():
+                    return StreamResult(
+                        success=True,
+                        final_position=current_position,
+                    )
                 logger.error("Failed to resolve stream URL for %s: %s", video_id, err)
                 return StreamResult(success=False, final_position=current_position, error=err)
             except RuntimeError as exc:
@@ -129,58 +149,67 @@ class Streamer:
                 return StreamResult(success=False, final_position=current_position, error=str(exc))
 
             try:
-                output_pipe = self._ensure_output_process()
-            except RuntimeError as exc:
-                logger.error("Failed to start RTMP output: %s", exc)
-                return StreamResult(
-                    success=False,
-                    final_position=current_position,
-                    error=str(exc),
+                output_pipe, output_generation, output_offset = (
+                    self._ensure_output_process()
                 )
-
-            try:
                 cmd = self._build_input_ffmpeg_cmd(
                     video_url,
                     audio_url,
                     seek_pos,
-                    stream_offset_seconds,
+                    output_offset,
                     output_pipe,
                 )
-            except RuntimeError as exc:
-                logger.error("Failed to build FFmpeg command: %s", exc)
+            except (OSError, RuntimeError) as exc:
+                logger.error("Failed to start RTMP output: %s", exc)
+                self._stop_output_process()
                 return StreamResult(
                     success=False,
                     final_position=current_position,
                     error=str(exc),
                 )
-            logger.debug("FFmpeg command: %s", " ".join(cmd))
+
+            logger.debug(
+                "FFmpeg input command: %s",
+                self._redact_sensitive_text(" ".join(cmd)),
+            )
 
             proc: subprocess.Popen[bytes] | None = None
             wall_start = time.monotonic()
-            last_save = 0.0
+            last_save = wall_start
             last_position = seek_pos
-            saved_position = seek_pos
+            saved_position = current_position
+            last_progress_at = wall_start
+            progress_seen = False
             position_lock = threading.Lock()
             stderr_tail: list[str] = []
             finished_naturally = False
             output_dropped = False
+            input_stalled = False
+            planned_output_cycle = False
             recovery_notified = False
             last_output_health_check = time.monotonic()
+            unhealthy_output_checks = 0
+            progress_thread: threading.Thread | None = None
 
             def set_position(position: float) -> None:
-                nonlocal last_position
+                nonlocal last_position, last_progress_at, progress_seen
                 with position_lock:
-                    last_position = position
+                    if position > last_position + 0.05:
+                        last_progress_at = time.monotonic()
+                        progress_seen = True
+                    last_position = max(last_position, position)
 
-            def get_position() -> float:
+            def get_progress() -> tuple[float, float, bool]:
                 with position_lock:
-                    return last_position
+                    return last_position, last_progress_at, progress_seen
 
             def read_progress() -> None:
                 if proc is None or proc.stderr is None:
                     return
                 for raw_line in proc.stderr:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    line = self._redact_sensitive_text(
+                        raw_line.decode("utf-8", errors="replace").strip()
+                    )
                     if line:
                         stderr_tail.append(line)
                         del stderr_tail[:-20]
@@ -205,16 +234,18 @@ class Streamer:
                 )
                 progress_thread.start()
 
-                while not self._stop_event_set(stop_event):
-                    if stop_event.is_set():
-                        break
+                while not stop_event.is_set():
                     if proc.poll() is not None:
                         break
+
+                    now = time.monotonic()
+                    progress_position, progress_at, has_progress = get_progress()
+
                     if self._output_dead.is_set():
                         output_dropped = True
                         diagnostic = self._output_process_summary()
                         health_position = max(
-                            get_position(),
+                            progress_position,
                             saved_position,
                             current_position,
                         )
@@ -233,35 +264,99 @@ class Streamer:
                         )
                         break
 
-                    now = time.monotonic()
+                    stalled_for = (
+                        now - progress_at if has_progress else now - wall_start
+                    )
+                    stall_limit = (
+                        self.INPUT_STALL_TIMEOUT_SECONDS
+                        if has_progress
+                        else self.INPUT_STARTUP_TIMEOUT_SECONDS
+                    )
+                    if stalled_for >= stall_limit:
+                        input_stalled = True
+                        output_dropped = True
+                        diagnostic = (
+                            f"no media progress for {stalled_for:.1f}s; "
+                            f"{self._output_process_summary()}"
+                        )
+                        logger.warning(
+                            "FFmpeg media progress stalled, restarting pipeline (%s)",
+                            diagnostic,
+                        )
+                        self._notify_stream_health(
+                            on_stream_health,
+                            "FFmpeg media progress stalled.",
+                            video_id,
+                            max(progress_position, saved_position, current_position),
+                            attempt,
+                            max_output_retries,
+                            diagnostic,
+                        )
+                        break
+
+                    emitted_seconds = max(0.0, progress_position - seek_pos)
+                    if (
+                        output_offset + emitted_seconds
+                        >= self.OUTPUT_MAX_TIMELINE_SECONDS
+                    ):
+                        planned_output_cycle = True
+                        output_dropped = True
+                        diagnostic = (
+                            f"output timeline reached "
+                            f"{output_offset + emitted_seconds:.1f}s"
+                        )
+                        logger.info(
+                            "Cycling RTMP output before MPEG-TS timestamp wrap (%s)",
+                            diagnostic,
+                        )
+                        self._notify_stream_health(
+                            on_stream_health,
+                            "RTMP output cycled before timestamp wrap.",
+                            video_id,
+                            max(progress_position, saved_position, current_position),
+                            attempt,
+                            max_output_retries,
+                            diagnostic,
+                        )
+                        break
+
                     if (
                         now - last_output_health_check
                         >= self.OUTPUT_HEALTH_CHECK_INTERVAL
                     ):
                         last_output_health_check = now
                         health_position = max(
-                            get_position(),
+                            progress_position,
                             saved_position,
                             current_position,
                         )
                         if self._output_tcp_connection_closed():
-                            output_dropped = True
-                            self._output_dead.set()
-                            diagnostic = self._output_process_summary()
-                            logger.warning(
-                                "RTMP output TCP connection closed, restarting stream (%s)",
-                                diagnostic,
-                            )
-                            self._notify_stream_health(
-                                on_stream_health,
-                                "RTMP TCP connection closed.",
-                                video_id,
-                                health_position,
-                                attempt,
-                                max_output_retries,
-                                diagnostic,
-                            )
-                            break
+                            unhealthy_output_checks += 1
+                            if (
+                                unhealthy_output_checks
+                                >= self.OUTPUT_UNHEALTHY_CHECKS
+                            ):
+                                output_dropped = True
+                                self._output_dead.set()
+                                diagnostic = self._output_process_summary()
+                                logger.warning(
+                                    "RTMP output TCP connection unhealthy, "
+                                    "restarting stream (%s)",
+                                    diagnostic,
+                                )
+                                self._notify_stream_health(
+                                    on_stream_health,
+                                    "RTMP TCP connection unhealthy.",
+                                    video_id,
+                                    health_position,
+                                    attempt,
+                                    max_output_retries,
+                                    diagnostic,
+                                )
+                                break
+                        else:
+                            unhealthy_output_checks = 0
+
                         if (
                             output_recovery_pending
                             and not recovery_notified
@@ -282,12 +377,12 @@ class Streamer:
                             recovery_notified = True
 
                     if now - last_save >= self.config.save_interval:
-                        elapsed = now - wall_start
-                        position = seek_pos + elapsed
+                        position = progress_position
                         if duration > 0:
                             position = min(position, float(duration))
-                        saved_position = position
-                        on_position(position)
+                        if position > saved_position + 0.05:
+                            saved_position = position
+                            on_position(position)
                         last_save = now
                         playback_logger.debug(
                             "Position saved: %.1fs / %ds",
@@ -295,18 +390,18 @@ class Streamer:
                             duration,
                         )
 
-                    if duration > 0 and max(last_position, saved_position) >= duration - 2:
+                    if duration > 0 and progress_position >= duration - 2:
                         playback_logger.info(
                             "Video near end (%.1fs), finishing",
-                            max(last_position, saved_position),
+                            progress_position,
                         )
                         finished_naturally = True
                         break
 
-                    time.sleep(0.5)
+                    stop_event.wait(0.5)
 
                 if proc.poll() is None:
-                    if output_dropped or stop_event.is_set():
+                    if output_dropped or input_stalled or stop_event.is_set():
                         proc.kill()
                         proc.wait()
                     else:
@@ -317,9 +412,20 @@ class Streamer:
                             proc.kill()
                             proc.wait()
 
-                progress_thread.join(timeout=2)
+                if progress_thread:
+                    progress_thread.join(timeout=2)
                 returncode = proc.returncode or 0
-                final_position = max(get_position(), saved_position)
+                progress_position, _, _ = get_progress()
+                final_position = max(
+                    progress_position,
+                    saved_position,
+                    current_position,
+                )
+                self._record_output_progress(
+                    output_generation,
+                    output_offset,
+                    max(0.0, progress_position - seek_pos),
+                )
 
                 if stop_event.is_set():
                     return StreamResult(success=True, final_position=final_position)
@@ -332,7 +438,11 @@ class Streamer:
                         video_id,
                         final_position,
                     )
-                    return StreamResult(success=True, final_position=final_position)
+                    return StreamResult(
+                        success=True,
+                        final_position=final_position,
+                        completed=True,
+                    )
 
                 stderr_joined = " ".join(stderr_tail[-10:])
                 output_failure = output_dropped or (
@@ -340,7 +450,12 @@ class Streamer:
                     or "Input/output error" in stderr_joined
                     or "Connection reset by peer" in stderr_joined
                 )
-                transient_input_failure = returncode in (-9, 255) or (
+                premature_eof = (
+                    returncode == 0
+                    and duration > 0
+                    and final_position < duration - 5
+                )
+                transient_input_failure = returncode in (-9, 255) or premature_eof or (
                     "Invalid data found when processing input" in stderr_joined
                     or "HTTP error 403 Forbidden" in stderr_joined
                 )
@@ -354,15 +469,22 @@ class Streamer:
                         attempt,
                         max_output_retries,
                     )
-                    if output_failure:
-                        output_recovery_pending = True
-                        self._stop_output_process()
-                    time.sleep(2)
+                    output_recovery_pending = not planned_output_cycle
+                    # Every retry gets a fresh publisher generation. Otherwise the
+                    # new input would reset PTS inside an already-running MPEG-TS
+                    # timeline and the output would drop packets indefinitely.
+                    self._stop_output_process()
+                    if stop_event.wait(2):
+                        return StreamResult(
+                            success=True,
+                            final_position=current_position,
+                        )
                     continue
 
-                if returncode != 0 and returncode != 255:
+                if output_failure or transient_input_failure or returncode != 0:
                     err_tail = f": {' | '.join(stderr_tail[-5:])}" if stderr_tail else ""
                     logger.warning("FFmpeg exited with code %d", returncode)
+                    self._stop_output_process()
                     return StreamResult(
                         success=False,
                         final_position=final_position,
@@ -377,28 +499,43 @@ class Streamer:
                     video_id,
                     final_position,
                 )
-                return StreamResult(success=True, final_position=final_position)
+                return StreamResult(
+                    success=True,
+                    final_position=final_position,
+                    completed=True,
+                )
 
             except Exception as exc:
                 logger.exception("Stream error for %s", video_id)
                 if proc and proc.poll() is None:
                     proc.kill()
+                    proc.wait()
+                if progress_thread:
+                    progress_thread.join(timeout=2)
+                progress_position, _, _ = get_progress()
+                current_position = max(progress_position, current_position)
+                # An arbitrary callback/DB/OS exception may have interrupted the
+                # writer after it emitted media. Reusing the publisher with the
+                # old generation offset would make the next writer jump backward.
+                self._stop_output_process()
                 if attempt < max_output_retries and (
                     "RTMP output process" in str(exc)
                     or self._output_dead.is_set()
                 ):
-                    current_position = max(get_position(), current_position)
                     logger.warning(
                         "Retrying %s after output failure at %.1fs",
                         video_id,
                         current_position,
                     )
-                    self._stop_output_process()
-                    time.sleep(2)
+                    if stop_event.wait(2):
+                        return StreamResult(
+                            success=True,
+                            final_position=current_position,
+                        )
                     continue
                 return StreamResult(
                     success=False,
-                    final_position=get_position(),
+                    final_position=current_position,
                     error=str(exc),
                 )
 
@@ -411,10 +548,14 @@ class Streamer:
     def close(self) -> None:
         self._stop_output_process()
 
-    def _ensure_output_process(self) -> str:
+    def _ensure_output_process(self) -> tuple[str, int, float]:
         with self._output_lock:
             if self._output_proc and self._output_proc.poll() is None:
-                return str(self._fifo_path)
+                return (
+                    str(self._fifo_path),
+                    self._output_generation,
+                    self._output_timeline_seconds,
+                )
 
             self._ensure_fifo()
             self._closing.clear()
@@ -427,6 +568,8 @@ class Streamer:
                 bufsize=0,
             )
             self._output_started_at = time.monotonic()
+            self._output_generation += 1
+            self._output_timeline_seconds = 0.0
             self._output_stderr_thread = threading.Thread(
                 target=self._drain_output_stderr,
                 name="ffmpeg-rtmp-output",
@@ -444,13 +587,18 @@ class Streamer:
                 "Persistent RTMP output started (pid=%s)",
                 self._output_proc.pid,
             )
-            return str(self._fifo_path)
+            return (
+                str(self._fifo_path),
+                self._output_generation,
+                self._output_timeline_seconds,
+            )
 
     def _stop_output_process(self) -> None:
         self._closing.set()
         with self._output_lock:
             proc = self._output_proc
             self._output_proc = None
+            self._output_timeline_seconds = 0.0
             keepalive_fd = self._fifo_keepalive_fd
             self._fifo_keepalive_fd = None
 
@@ -479,6 +627,23 @@ class Streamer:
 
         self._cleanup_fifo()
 
+    def _record_output_progress(
+        self,
+        generation: int,
+        starting_offset: float,
+        emitted_seconds: float,
+    ) -> None:
+        """Advance only the timeline belonging to the active RTMP process."""
+        with self._output_lock:
+            if generation != self._output_generation or not self._output_proc:
+                return
+            if self._output_proc.poll() is not None:
+                return
+            self._output_timeline_seconds = max(
+                self._output_timeline_seconds,
+                starting_offset + max(0.0, emitted_seconds),
+            )
+
     def _cleanup_fifo(self) -> None:
         try:
             if self._fifo_path.exists():
@@ -506,7 +671,9 @@ class Streamer:
             return
 
         for raw_line in proc.stderr:
-            line = raw_line.decode("utf-8", errors="replace").strip()
+            line = self._redact_sensitive_text(
+                raw_line.decode("utf-8", errors="replace").strip()
+            )
             if line:
                 with self._output_stderr_lock:
                     self._output_stderr_tail.append(line)
@@ -553,7 +720,12 @@ class Streamer:
             return True
 
         sockets = self._output_tcp_sockets(socket_inodes)
-        for socket_info in sockets:
+        rtmp_sockets = [
+            socket_info
+            for socket_info in sockets
+            if socket_info.remote.rsplit(":", 1)[-1] == "1935"
+        ]
+        for socket_info in rtmp_sockets:
             if socket_info.state in self.TCP_CLOSED_STATES:
                 logger.warning(
                     "RTMP output socket entered closed TCP state: %s (%s)",
@@ -562,10 +734,16 @@ class Streamer:
                 )
                 return True
 
-        if not sockets:
+        if not rtmp_sockets:
             logger.warning(
-                "RTMP output socket disappeared from TCP table (inodes=%s, %s)",
+                "RTMP output has no Twitch TCP socket (inodes=%s, %s)",
                 ",".join(sorted(socket_inodes)),
+                self._output_process_summary(proc),
+            )
+            return True
+        if not any(socket_info.state == "01" for socket_info in rtmp_sockets):
+            logger.warning(
+                "RTMP output has no established Twitch TCP socket (%s)",
                 self._output_process_summary(proc),
             )
             return True
@@ -693,6 +871,21 @@ class Streamer:
     def _stop_event_set(stop_event: threading.Event) -> bool:
         return stop_event.is_set()
 
+    @classmethod
+    def _redact_sensitive_text(cls, value: str) -> str:
+        value = cls.RTMP_URL_RE.sub(r"\1[REDACTED]", value)
+        return cls.HTTP_URL_RE.sub("[source-url]", value)
+
+    @classmethod
+    def _subprocess_error_text(cls, exc: BaseException) -> str:
+        for attribute in ("stderr", "stdout"):
+            value = getattr(exc, attribute, None)
+            if value:
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                return cls._redact_sensitive_text(str(value).strip())
+        return cls._redact_sensitive_text(str(exc))
+
     @staticmethod
     def _notify_stream_health(
         callback: Callable[[str, dict[str, str]], None] | None,
@@ -706,15 +899,19 @@ class Streamer:
         if not callback:
             return
 
-        callback(
-            message,
-            {
-                "Video ID": video_id,
-                "Position": f"{position:.1f}s",
-                "Attempt": f"{attempt}/{max_attempts}",
-                "Diagnostic": diagnostic,
-            },
-        )
+        try:
+            callback(
+                message,
+                {
+                    "Video ID": video_id,
+                    "Position": f"{position:.1f}s",
+                    "Attempt": f"{attempt}/{max_attempts}",
+                    "Diagnostic": diagnostic,
+                },
+            )
+        except Exception:
+            # Notifications are optional and must never interrupt RTMP recovery.
+            logger.exception("Stream-health notification failed")
 
     def _build_output_ffmpeg_cmd(self) -> list[str]:
         return [
@@ -762,7 +959,7 @@ class Streamer:
         video_url: str,
         audio_url: str | None,
         seek_pos: float,
-        stream_offset_seconds: float,
+        output_offset_seconds: float,
         output_pipe: str,
     ) -> list[str]:
         cfg = self.config
@@ -772,7 +969,7 @@ class Streamer:
             f"pad={self.OUTPUT_WIDTH}:{self.OUTPUT_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
             f"fps={self.OUTPUT_FPS},setpts=PTS-STARTPTS,format=yuv420p"
         )
-        ts_offset = max(0.0, stream_offset_seconds)
+        ts_offset = max(0.0, output_offset_seconds)
 
         common_prefix = [
             "ffmpeg",
@@ -852,7 +1049,7 @@ class Streamer:
                 "-f",
                 "mpegts",
                 "-mpegts_flags",
-                "+resend_headers",
+                "+resend_headers+initial_discontinuity",
                 "-muxdelay",
                 "0",
                 "-muxpreload",
@@ -905,7 +1102,7 @@ class Streamer:
             "-f",
             "mpegts",
             "-mpegts_flags",
-            "+resend_headers",
+            "+resend_headers+initial_discontinuity",
             "-muxdelay",
             "0",
             "-muxpreload",

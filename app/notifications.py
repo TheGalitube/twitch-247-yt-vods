@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import queue
+import threading
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -54,6 +57,11 @@ class Notifier:
         self.webhook_url = webhook_url
         self.channel = channel
         self.state_path = state_path
+        self._queue: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue(
+            maxsize=50
+        )
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -95,16 +103,51 @@ class Notifier:
             ]
         }
 
+        self._ensure_worker()
         try:
-            self._upsert_message(bucket, payload)
-            if bucket == "status" and "error" not in self._load_state():
-                self._upsert_message("error", self._empty_error_payload())
-            if bucket == "status" and "stream_health" not in self._load_state():
-                self._upsert_message("stream_health", self._empty_stream_health_payload())
-        except requests.RequestException as exc:
-            logger.warning("Discord notification failed: %s", exc)
-        except OSError as exc:
-            logger.warning("Discord notification state update failed: %s", exc)
+            self._queue.put_nowait((bucket, payload))
+        except queue.Full:
+            logger.warning("Discord notification queue full; dropping %s update", bucket)
+
+    def _ensure_worker(self) -> None:
+        with self._worker_lock:
+            if self._worker and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="discord-notifications",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            bucket, payload = self._queue.get()
+            try:
+                self._upsert_message(bucket, payload)
+                state = self._load_state()
+                if bucket == "status" and "error" not in state:
+                    self._upsert_message("error", self._empty_error_payload())
+                    state = self._load_state()
+                if bucket == "status" and "stream_health" not in state:
+                    self._upsert_message(
+                        "stream_health",
+                        self._empty_stream_health_payload(),
+                    )
+            except requests.RequestException as exc:
+                # requests exception strings contain the full webhook URL/token.
+                logger.warning(
+                    "Discord notification failed (%s)",
+                    type(exc).__name__,
+                )
+            except Exception as exc:
+                # Notifications are optional and may never stop playback.
+                logger.warning(
+                    "Discord notification update failed (%s)",
+                    type(exc).__name__,
+                )
+            finally:
+                self._queue.task_done()
 
     def _upsert_message(self, bucket: str, payload: dict[str, object]) -> None:
         message_id = self._load_state().get(bucket)
@@ -112,7 +155,7 @@ class Notifier:
             resp = requests.patch(
                 f"{self.webhook_url}/messages/{message_id}",
                 json=payload,
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code != 404:
                 resp.raise_for_status()
@@ -120,7 +163,7 @@ class Notifier:
 
             logger.info("Discord %s message %s no longer exists; creating a new one", bucket, message_id)
 
-        resp = requests.post(f"{self.webhook_url}?wait=true", json=payload, timeout=10)
+        resp = requests.post(f"{self.webhook_url}?wait=true", json=payload, timeout=5)
         resp.raise_for_status()
         new_message_id = str(resp.json()["id"])
         state = self._load_state()
@@ -133,7 +176,13 @@ class Notifier:
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("Could not read Discord notification state: %s", exc)
+            logger.warning(
+                "Could not read Discord notification state (%s)",
+                type(exc).__name__,
+            )
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("Discord notification state is not an object; resetting")
             return {}
         return {
             str(key): str(value)
@@ -145,10 +194,13 @@ class Notifier:
         if not self.state_path:
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
+        temporary_path = self.state_path.with_name(f".{self.state_path.name}.tmp")
+        temporary_path.write_text(
             json.dumps(state, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, self.state_path)
 
     @staticmethod
     def _truncate(value: str, limit: int) -> str:

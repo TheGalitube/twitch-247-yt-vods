@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -89,7 +91,15 @@ class YouTubeSync:
                 new_count += 1
                 logger.info("New video discovered: %s (%s)", video.title, video.video_id)
 
-        deleted_count = self.db.prune_videos({video.video_id for video in videos})
+        if videos:
+            deleted_count = self.db.prune_videos(
+                {video.video_id for video in videos}
+            )
+        else:
+            # An empty yt-dlp response is often a transient extraction/API
+            # failure. Never erase the known playback queue on that signal.
+            deleted_count = 0
+            logger.warning("YouTube sync returned no usable videos; keeping local queue")
         stats = self.db.get_stats()
         self.db.log_sync(new_count, stats.total_videos)
         logger.info(
@@ -136,7 +146,8 @@ class YouTubeSync:
 
             known = known_videos.get(video_id)
             title = entry.get("title") or "Untitled"
-            duration = int(entry.get("duration") or 0) or (known.duration if known else 0)
+            duration = self._parse_duration(entry.get("duration"))
+            duration = duration or (known.duration if known else 0)
             upload_date = entry.get("upload_date") or (known.upload_date if known else None)
 
             video = YouTubeVideo(
@@ -223,7 +234,7 @@ class YouTubeSync:
                 return YouTubeVideo(
                     video_id=video_id,
                     title=parts[0],
-                    duration=int(parts[1] or 0),
+                    duration=self._parse_duration(parts[1]),
                     upload_date=parts[2] or None,
                 )
         except subprocess.CalledProcessError as exc:
@@ -236,6 +247,18 @@ class YouTubeSync:
         except (ValueError, subprocess.TimeoutExpired) as exc:
             logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
         return None
+
+    @staticmethod
+    def _parse_duration(value: object) -> int:
+        if value is None:
+            return 0
+        normalized = str(value).strip()
+        if not normalized or normalized.upper() in {"NA", "N/A", "NONE", "NULL"}:
+            return 0
+        try:
+            return max(0, int(float(normalized)))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def is_upcoming_live_error(error: str) -> bool:
@@ -255,7 +278,11 @@ class YouTubeSync:
         ) or "use --cookies-from-browser or --cookies" in normalized
 
     @staticmethod
-    def get_stream_urls(video_id: str) -> tuple[str, str | None]:
+    def get_stream_urls(
+        video_id: str,
+        stop_event: threading.Event | None = None,
+        timeout: float = 120.0,
+    ) -> tuple[str, str | None]:
         """
         Resolve direct stream URL(s) via yt-dlp without downloading.
         Returns (primary_url, audio_url_or_none).
@@ -269,14 +296,49 @@ class YouTubeSync:
             "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
             url,
         ]
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=True,
-            timeout=120,
         )
-        lines = [ln.strip() for ln in result.stdout.strip().split("\n") if ln.strip()]
+        deadline = time.monotonic() + timeout
+        while True:
+            if stop_event and stop_event.is_set():
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.communicate()
+                raise InterruptedError("Stream URL resolution interrupted")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
+
+            try:
+                stdout, stderr = proc.communicate(timeout=min(1.0, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+        if proc.returncode:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                cmd,
+                output=stdout,
+                stderr=stderr,
+            )
+
+        lines = [ln.strip() for ln in stdout.strip().split("\n") if ln.strip()]
         if not lines:
             raise RuntimeError(f"No stream URL returned for {video_id}")
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import signal
 import sys
 import threading
@@ -42,7 +41,8 @@ class Twitch247App:
         self._first_start = True
         self._reconnect_delay = self.RECONNECT_DELAY
         self._last_sync = 0.0
-        self._stream_clock = 0.0
+        self._sync_lock = threading.Lock()
+        self._sync_thread: threading.Thread | None = None
         self._allow_restart_seek_tolerance = False
         self._resume_mode = False
         self._reset_stream_timer_on_next_play = False
@@ -54,12 +54,6 @@ class Twitch247App:
         logger.info("Twitch247 starting (v1.0.0)")
         self.db.log_event("startup", "Service started")
 
-        try:
-            self.youtube.sync()
-        except Exception as exc:
-            logger.error("Initial YouTube sync failed: %s", exc)
-            self._record_error(str(exc))
-
         resume = self.db.get_resume_video()
         if resume:
             logger.info(
@@ -68,12 +62,22 @@ class Twitch247App:
                 resume.current_position_seconds,
             )
             self.notifier.service_restart(resume.title, resume.current_position_seconds)
-            self._stream_clock = self._restore_stream_clock()
             self._allow_restart_seek_tolerance = True
             self._resume_mode = True
             self._reset_stream_timer_on_next_play = True
             self._first_start = False
-        
+            # A restart must resume media immediately. Channel discovery can take
+            # several minutes and therefore runs in the background.
+            self._maybe_sync(force=True)
+        else:
+            try:
+                self.youtube.sync()
+            except Exception as exc:
+                logger.error("Initial YouTube sync failed: %s", exc)
+                self._record_error(str(exc))
+            finally:
+                self._last_sync = time.monotonic()
+
         try:
             while not self._stop_event.is_set():
                 self._maybe_sync()
@@ -84,18 +88,30 @@ class Twitch247App:
                 if not video:
                     logger.warning("No videos available, waiting for sync...")
                     self._interruptible_sleep(60)
-                    try:
-                        self.youtube.sync()
-                    except Exception as exc:
-                        logger.error("Sync failed: %s", exc)
+                    self._maybe_sync(force=True)
                     continue
 
-                self._play_video(video)
+                try:
+                    self._play_video(video)
+                except Exception as exc:
+                    logger.exception(
+                        "Unexpected playback error for %s; resetting pipeline",
+                        video.video_id,
+                    )
+                    try:
+                        self._record_error(str(exc))
+                        self.db.set_streaming(False)
+                    except Exception:
+                        logger.exception("Could not persist unexpected playback error")
+                    self.streamer.close()
+                    self._interruptible_sleep(self.ERROR_RETRY_DELAY)
         finally:
             self.streamer.close()
-
-        logger.info("Twitch247 shutting down")
-        self.db.set_streaming(False)
+            try:
+                self.db.set_streaming(False)
+            except Exception:
+                logger.exception("Could not persist shutdown state")
+            logger.info("Twitch247 shutting down")
 
     def _select_video(self, resume: Video | None) -> Video | None:
         if resume:
@@ -149,7 +165,6 @@ class Twitch247App:
             video_id=video.video_id,
             title=video.title,
             start_position=position,
-            stream_offset_seconds=self._stream_clock,
             seek_tolerance_seconds=(
                 self.config.seek_tolerance if self._allow_restart_seek_tolerance else 0.0
             ),
@@ -161,9 +176,6 @@ class Twitch247App:
 
         self._allow_restart_seek_tolerance = False
 
-        played_seconds = max(0.0, result.final_position - position)
-        self._stream_clock += played_seconds
-
         if self._stop_event.is_set():
             self.db.save_position(video.video_id, result.final_position)
             return
@@ -171,8 +183,11 @@ class Twitch247App:
         if result.success:
             self._reconnect_delay = self.RECONNECT_DELAY
             finished = (
-                video.duration > 0
-                and result.final_position >= video.duration - 5
+                result.completed
+                or (
+                    video.duration > 0
+                    and result.final_position >= video.duration - 5
+                )
             )
             if finished:
                 self.db.set_video_status(video.video_id, "played", 0.0)
@@ -233,14 +248,30 @@ class Twitch247App:
             self.MAX_RECONNECT_DELAY,
         )
 
-    def _maybe_sync(self) -> None:
+    def _maybe_sync(self, force: bool = False) -> None:
         now = time.monotonic()
-        if now - self._last_sync >= self.config.sync_interval:
-            try:
-                self.youtube.sync()
-            except Exception as exc:
-                logger.error("Periodic sync failed: %s", exc)
+        with self._sync_lock:
+            if self._sync_thread and self._sync_thread.is_alive():
+                return
+            if not force and now - self._last_sync < self.config.sync_interval:
+                return
             self._last_sync = now
+            self._sync_thread = threading.Thread(
+                target=self._run_sync,
+                name="youtube-channel-sync",
+                daemon=True,
+            )
+            self._sync_thread.start()
+
+    def _run_sync(self) -> None:
+        try:
+            self.youtube.sync()
+        except Exception as exc:
+            logger.error("Periodic sync failed: %s", exc)
+            try:
+                self._record_error(str(exc))
+            except Exception:
+                logger.exception("Could not persist sync error")
 
     def _record_error(self, error: str) -> None:
         self.db.set_error(error)
@@ -248,23 +279,6 @@ class Twitch247App:
 
     def _interruptible_sleep(self, seconds: float) -> None:
         self._stop_event.wait(timeout=seconds)
-
-    def _restore_stream_clock(self) -> float:
-        state = self.db.get_playback_state()
-        if state.stream_started_at:
-            try:
-                started_at = datetime.strptime(
-                    state.stream_started_at,
-                    "%Y-%m-%d %H:%M:%S",
-                ).replace(tzinfo=timezone.utc)
-                return max(0.0, (datetime.now(timezone.utc) - started_at).total_seconds())
-            except ValueError:
-                logger.warning(
-                    "Invalid stream_started_at value %r, falling back to video position",
-                    state.stream_started_at,
-                )
-
-        return max(0.0, state.current_position_seconds)
 
     def _handle_signal(self, signum: int, _frame: object) -> None:
         logger.info("Received signal %d, stopping...", signum)
