@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -36,6 +37,7 @@ class UnplayableYouTubeVideo(RuntimeError):
 class YouTubeSync:
     DEFAULT_METADATA_WORKERS = 4
     DEFAULT_SYNC_LIMIT = 15
+    EXCLUDED_TITLE_SUBSTRINGS = ("24/7",)
     YT_DLP_BASE = [
         sys.executable,
         "-m",
@@ -76,10 +78,23 @@ class YouTubeSync:
         new_count = 0
 
         try:
-            videos = self._fetch_channel_videos()
+            discovered_videos = self._fetch_channel_videos()
         except subprocess.CalledProcessError as exc:
             logger.error("yt-dlp channel sync failed: %s", exc.stderr or exc)
             raise
+
+        videos = [
+            video
+            for video in discovered_videos
+            if not self._title_is_excluded(video.title)
+        ]
+        for video in discovered_videos:
+            if self._title_is_excluded(video.title):
+                logger.info(
+                    "Excluded YouTube video by title filter: %s (%s)",
+                    video.title,
+                    video.video_id,
+                )
 
         for video in videos:
             if self.db.upsert_video(
@@ -91,7 +106,7 @@ class YouTubeSync:
                 new_count += 1
                 logger.info("New video discovered: %s (%s)", video.title, video.video_id)
 
-        if videos:
+        if discovered_videos:
             deleted_count = self.db.prune_videos(
                 {video.video_id for video in videos}
             )
@@ -109,6 +124,15 @@ class YouTubeSync:
             stats.total_videos,
         )
         return new_count
+
+    @classmethod
+    def _title_is_excluded(cls, title: str) -> bool:
+        normalized_title = unicodedata.normalize("NFKC", title).casefold()
+        return any(
+            unicodedata.normalize("NFKC", substring).casefold()
+            in normalized_title
+            for substring in cls.EXCLUDED_TITLE_SUBSTRINGS
+        )
 
     def _fetch_channel_videos(self) -> list[YouTubeVideo]:
         cmd = [
@@ -130,87 +154,128 @@ class YouTubeSync:
         if not entries and data.get("id"):
             entries = [data]
 
-        if self.sync_limit > 0:
-            entries = entries[: self.sync_limit]
-
         known_videos = self.db.get_video_index()
         videos: list[YouTubeVideo] = []
-        metadata_needed: dict[str, YouTubeVideo] = {}
+        entry_index = 0
+        replacement_slots = self.sync_limit or len(entries)
 
-        for entry in entries:
-            if not entry:
-                continue
-            video_id = entry.get("id") or entry.get("url", "").split("=")[-1]
-            if not video_id or len(video_id) != 11:
-                continue
+        while entry_index < len(entries) and replacement_slots > 0:
+            batch: list[YouTubeVideo] = []
+            batch_included_count = 0
 
-            known = known_videos.get(video_id)
-            title = entry.get("title") or "Untitled"
-            duration = self._parse_duration(entry.get("duration"))
-            duration = duration or (known.duration if known else 0)
-            upload_date = entry.get("upload_date") or (known.upload_date if known else None)
+            while (
+                entry_index < len(entries)
+                and batch_included_count < replacement_slots
+            ):
+                entry = entries[entry_index]
+                entry_index += 1
+                if not entry:
+                    continue
+                video_id = entry.get("id") or entry.get("url", "").split("=")[-1]
+                if not video_id or len(video_id) != 11:
+                    continue
 
-            video = YouTubeVideo(
-                video_id=video_id,
-                title=title,
-                duration=duration,
-                upload_date=upload_date,
-            )
-            videos.append(video)
-
-            if known and known.duration > 0 and known.upload_date:
-                continue
-
-            if duration == 0 or not upload_date:
-                metadata_needed[video_id] = video
-
-        if metadata_needed:
-            logger.info(
-                "Fetching detailed metadata for %d videos with %d workers",
-                len(metadata_needed),
-                self.metadata_workers,
-            )
-            videos_by_id = {video.video_id: video for video in videos}
-            with ThreadPoolExecutor(max_workers=self.metadata_workers) as executor:
-                futures = {
-                    executor.submit(self._fetch_video_metadata, video_id): video_id
-                    for video_id in metadata_needed
-                }
-                for future in as_completed(futures):
-                    video_id = futures[future]
-                    try:
-                        meta = future.result()
-                    except UpcomingLiveEvent as exc:
-                        logger.info("Skipping unavailable YouTube video %s: %s", video_id, exc)
-                        videos_by_id.pop(video_id, None)
-                        continue
-                    except UnplayableYouTubeVideo as exc:
-                        logger.warning(
-                            "Keeping YouTube video %s despite metadata auth error: %s",
-                            video_id,
-                            exc,
-                        )
-                        continue
-                    except Exception as exc:
-                        logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
-                        continue
-                    if not meta:
-                        continue
-
-                    current = videos_by_id[video_id]
-                    videos_by_id[video_id] = YouTubeVideo(
+                known = known_videos.get(video_id)
+                title = entry.get("title") or "Untitled"
+                duration = self._parse_duration(entry.get("duration"))
+                duration = duration or (known.duration if known else 0)
+                upload_date = entry.get("upload_date") or (
+                    known.upload_date if known else None
+                )
+                batch.append(
+                    YouTubeVideo(
                         video_id=video_id,
-                        title=meta.title or current.title,
-                        duration=meta.duration or current.duration,
-                        upload_date=meta.upload_date or current.upload_date,
+                        title=title,
+                        duration=duration,
+                        upload_date=upload_date,
                     )
-            videos = [
-                videos_by_id[video.video_id]
-                for video in videos
-                if video.video_id in videos_by_id
-            ]
+                )
+                if not self._title_is_excluded(title):
+                    batch_included_count += 1
+
+            if not batch:
+                continue
+
+            included_before_metadata = {
+                video.video_id
+                for video in batch
+                if not self._title_is_excluded(video.title)
+            }
+            batch = self._enrich_video_metadata(batch, known_videos)
+            videos.extend(batch)
+            replacement_slots = sum(
+                video.video_id in included_before_metadata
+                and self._title_is_excluded(video.title)
+                for video in batch
+            )
+
+            if self.sync_limit == 0:
+                break
 
         return videos
+
+    def _enrich_video_metadata(
+        self,
+        videos: list[YouTubeVideo],
+        known_videos: dict[str, object],
+    ) -> list[YouTubeVideo]:
+        metadata_needed: dict[str, YouTubeVideo] = {}
+        for video in videos:
+            if self._title_is_excluded(video.title):
+                continue
+            known = known_videos.get(video.video_id)
+            if known and known.duration > 0 and known.upload_date:
+                continue
+            if video.duration == 0 or not video.upload_date:
+                metadata_needed[video.video_id] = video
+
+        if not metadata_needed:
+            return videos
+
+        logger.info(
+            "Fetching detailed metadata for %d videos with %d workers",
+            len(metadata_needed),
+            self.metadata_workers,
+        )
+        videos_by_id = {video.video_id: video for video in videos}
+        with ThreadPoolExecutor(max_workers=self.metadata_workers) as executor:
+            futures = {
+                executor.submit(self._fetch_video_metadata, video_id): video_id
+                for video_id in metadata_needed
+            }
+            for future in as_completed(futures):
+                video_id = futures[future]
+                try:
+                    meta = future.result()
+                except UpcomingLiveEvent as exc:
+                    logger.info("Skipping unavailable YouTube video %s: %s", video_id, exc)
+                    videos_by_id.pop(video_id, None)
+                    continue
+                except UnplayableYouTubeVideo as exc:
+                    logger.warning(
+                        "Keeping YouTube video %s despite metadata auth error: %s",
+                        video_id,
+                        exc,
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning("Could not fetch metadata for %s: %s", video_id, exc)
+                    continue
+                if not meta:
+                    continue
+
+                current = videos_by_id[video_id]
+                videos_by_id[video_id] = YouTubeVideo(
+                    video_id=video_id,
+                    title=meta.title or current.title,
+                    duration=meta.duration or current.duration,
+                    upload_date=meta.upload_date or current.upload_date,
+                )
+        return [
+            videos_by_id[video.video_id]
+            for video in videos
+            if video.video_id in videos_by_id
+        ]
 
     def _fetch_video_metadata(self, video_id: str) -> YouTubeVideo | None:
         url = f"https://www.youtube.com/watch?v={video_id}"
