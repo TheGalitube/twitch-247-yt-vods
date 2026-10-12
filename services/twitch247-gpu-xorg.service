@@ -1,0 +1,12 @@
+[Unit]
+Description=Twitch247 GPU Xorg display for OBS
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/xorg/Xorg :2 -noreset -nolisten tcp -novtswitch -sharevts -ac
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=twitch247-obs-stack.target

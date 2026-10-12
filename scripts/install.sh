@@ -681,11 +681,33 @@ install -o root -g root -m 0644 \
 install -o root -g root -m 0644 \
     "$STAGED_SOURCE/services/twitch247-watchdog.timer" \
     /etc/systemd/system/twitch247-watchdog.timer
+install -o root -g root -m 0644 \
+    "$STAGED_SOURCE/services/twitch247-gpu-xorg.service" \
+    /etc/systemd/system/twitch247-gpu-xorg.service
+install -o root -g root -m 0644 \
+    "$STAGED_SOURCE/services/twitch247-obs-vnc.service" \
+    /etc/systemd/system/twitch247-obs-vnc.service
+install -o root -g root -m 0644 \
+    "$STAGED_SOURCE/services/twitch247-obs-start.service" \
+    /etc/systemd/system/twitch247-obs-start.service
+install -o root -g root -m 0644 \
+    "$STAGED_SOURCE/services/twitch247-obs-stack.target" \
+    /etc/systemd/system/twitch247-obs-stack.target
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0700 \
+    "/home/$APP_USER/.config/systemd/user"
+install -o "$APP_USER" -g "$APP_GROUP" -m 0600 \
+    "$STAGED_SOURCE/services/twitch247-obs-user.service" \
+    "/home/$APP_USER/.config/systemd/user/twitch247-obs.service"
 
 systemctl daemon-reload
 systemctl enable twitch247.service
 systemctl enable twitch247-dashboard.service
 systemctl enable twitch247-watchdog.timer
+systemctl enable twitch247-obs-stack.target
+runuser -u "$APP_USER" -- env XDG_RUNTIME_DIR=/run/user/997 \
+    systemctl --user daemon-reload
+runuser -u "$APP_USER" -- env XDG_RUNTIME_DIR=/run/user/997 \
+    systemctl --user enable twitch247-obs.service
 
 info "Restoring services that were active before the upgrade..."
 if (( STREAMER_WAS_ACTIVE == 1 )); then

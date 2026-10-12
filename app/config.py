@@ -26,6 +26,8 @@ def _find_config_path() -> Path:
 class Config:
     twitch_stream_key: str
     twitch_channel: str
+    stream_output_mode: str
+    obs_feed_url: str
     youtube_channel_url: str
     log_level: str
     save_interval: int
@@ -69,6 +71,11 @@ def load_config() -> Config:
     return Config(
         twitch_stream_key=os.environ["TWITCH_STREAM_KEY"],
         twitch_channel=os.getenv("TWITCH_CHANNEL", ""),
+        stream_output_mode=os.getenv("STREAM_OUTPUT_MODE", "rtmp").strip().lower(),
+        obs_feed_url=os.getenv(
+            "OBS_FEED_URL",
+            "tcp://127.0.0.1:5000?listen=1",
+        ).strip(),
         youtube_channel_url=os.environ["YOUTUBE_CHANNEL_URL"],
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         save_interval=int(os.getenv("SAVE_INTERVAL", "15")),

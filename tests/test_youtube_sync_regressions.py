@@ -30,6 +30,28 @@ class YouTubeDurationRegressionTests(unittest.TestCase):
         self.assertEqual(123, self.sync._parse_duration("123.9"))
         self.assertEqual(456, self.sync._parse_duration(456))
 
+    def test_stream_format_prefers_30_fps_h264(self) -> None:
+        preferred, *_fallbacks = YouTubeSync.STREAM_FORMAT.split("/")
+
+        self.assertIn("vcodec^=avc1", preferred)
+        self.assertIn("height>=720", preferred)
+        self.assertIn("fps<=30", preferred)
+
+    def test_stream_url_403_is_treated_as_unplayable_not_retryable(self) -> None:
+        self.assertTrue(
+            YouTubeSync.is_youtube_auth_error(
+                "FFmpeg exit code 1: [https] HTTP error 403 Forbidden "
+                "[source-url] Server returned 403 Forbidden (access denied)"
+            )
+        )
+
+    def test_yt_dlp_defaults_to_android_player_client(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            cmd = YouTubeSync._yt_dlp_cmd()
+
+        self.assertIn("--extractor-args", cmd)
+        self.assertIn("youtube:player_client=android", cmd)
+
     def test_sync_excludes_24_7_title_from_upsert_and_prune_keep_set(self) -> None:
         included = SimpleNamespace(
             video_id="included001",
@@ -91,6 +113,12 @@ class YouTubeDurationRegressionTests(unittest.TestCase):
             self.assertTrue(
                 YouTubeSync._title_is_excluded("LIVE ２４／７ rebroadcast")
             )
+
+    def test_title_filter_excludes_shorts_hashtag_case_insensitively(self) -> None:
+        self.assertTrue(
+            YouTubeSync._title_is_excluded("A separate vertical stream #Shorts")
+        )
+        self.assertFalse(YouTubeSync._title_is_excluded("A regular stream"))
 
     @patch("app.youtube_sync.subprocess.run")
     def test_fetch_backfills_limit_after_flat_title_exclusion(self, run: Mock) -> None:

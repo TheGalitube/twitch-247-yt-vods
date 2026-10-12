@@ -11,6 +11,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable
+from urllib.parse import urlparse
 
 from app.config import Config
 from app.logging_setup import get_logger
@@ -53,6 +54,9 @@ class Streamer:
     OUTPUT_MAX_TIMELINE_SECONDS = 20 * 60 * 60
     INPUT_STARTUP_TIMEOUT_SECONDS = 90.0
     INPUT_STALL_TIMEOUT_SECONDS = 60.0
+    OBS_INPUT_STARTUP_TIMEOUT_SECONDS = 30.0
+    OBS_INPUT_STALL_TIMEOUT_SECONDS = 15.0
+    OUTPUT_HANDOVER_GAP_SECONDS = 0.1
     TCP_CLOSED_STATES = {
         "04",  # FIN_WAIT1
         "05",  # FIN_WAIT2
@@ -90,6 +94,80 @@ class Streamer:
         self._output_stderr_tail: deque[str] = deque(maxlen=20)
         self._output_stderr_lock = threading.Lock()
 
+    @property
+    def _uses_twitch_rtmp(self) -> bool:
+        return getattr(self.config, "stream_output_mode", "rtmp") == "rtmp"
+
+    @property
+    def _output_name(self) -> str:
+        return "RTMP" if self._uses_twitch_rtmp else "OBS feed"
+
+    def _input_progress_timeout(self, progress_seen: bool) -> float:
+        if self._uses_twitch_rtmp:
+            return (
+                self.INPUT_STALL_TIMEOUT_SECONDS
+                if progress_seen
+                else self.INPUT_STARTUP_TIMEOUT_SECONDS
+            )
+        return (
+            self.OBS_INPUT_STALL_TIMEOUT_SECONDS
+            if progress_seen
+            else self.OBS_INPUT_STARTUP_TIMEOUT_SECONDS
+        )
+
+    def _keep_output_for_source_failure(self) -> bool:
+        """Keep the local relay connected while a failed source is replaced."""
+        return not self._uses_twitch_rtmp and self._output_process_is_running()
+
+    def _output_process_is_running(self) -> bool:
+        return self._output_proc is not None and self._output_proc.poll() is None
+
+    def _output_timeline_needs_cycle(self, timeline_seconds: float) -> bool:
+        # MPEG-TS timestamps wrap by design, and OBS/FFmpeg handle that wrap.
+        # Cycling is only retained for the direct Twitch publisher, where a new
+        # RTMP session is safer than changing a long-lived FLV timestamp epoch.
+        return (
+            self._uses_twitch_rtmp
+            and timeline_seconds >= self.OUTPUT_MAX_TIMELINE_SECONDS
+        )
+
+    def _stop_output_unless_source_only_failure(self) -> bool:
+        """Return True when the OBS relay stays alive for source recovery."""
+        if self._keep_output_for_source_failure():
+            return True
+        self._stop_output_process()
+        return False
+
+    def _classify_ffmpeg_failure(
+        self,
+        returncode: int,
+        stderr_text: str,
+        *,
+        output_dropped: bool,
+        premature_eof: bool,
+    ) -> tuple[bool, bool]:
+        transport_error = any(
+            marker in stderr_text
+            for marker in (
+                "Broken pipe",
+                "Input/output error",
+                "Connection reset by peer",
+            )
+        )
+        relay_can_survive = self._keep_output_for_source_failure()
+        output_failure = output_dropped or (
+            transport_error and not relay_can_survive
+        )
+        transient_input_failure = (
+            returncode in (-9, 255)
+            or premature_eof
+            or "Invalid data found when processing input" in stderr_text
+            or "HTTP error 403 Forbidden" in stderr_text
+            or (transport_error and relay_can_survive)
+            or (returncode != 0 and relay_can_survive)
+        )
+        return output_failure, transient_input_failure
+
     def stream_video(
         self,
         video_id: str,
@@ -107,6 +185,12 @@ class Streamer:
         output_recovery_pending = False
 
         for attempt in range(1, max_output_retries + 1):
+            if not self._uses_twitch_rtmp and self._output_obs_client_disconnected():
+                logger.warning(
+                    "OBS client is disconnected; recreating local MPEG-TS relay"
+                )
+                self._stop_output_process()
+
             seek_pos = max(0.0, current_position - max(0.0, seek_tolerance_seconds))
             if attempt == 1:
                 playback_logger.info(
@@ -136,7 +220,7 @@ class Streamer:
                 OSError,
             ) as exc:
                 err = self._subprocess_error_text(exc)
-                self._stop_output_process()
+                self._stop_output_unless_source_only_failure()
                 if stop_event.is_set():
                     return StreamResult(
                         success=True,
@@ -145,7 +229,7 @@ class Streamer:
                 logger.error("Failed to resolve stream URL for %s: %s", video_id, err)
                 return StreamResult(success=False, final_position=current_position, error=err)
             except RuntimeError as exc:
-                self._stop_output_process()
+                self._stop_output_unless_source_only_failure()
                 return StreamResult(success=False, final_position=current_position, error=str(exc))
 
             try:
@@ -250,12 +334,13 @@ class Streamer:
                             current_position,
                         )
                         logger.warning(
-                            "RTMP output went away, restarting stream (%s)",
+                            "%s output went away, restarting stream (%s)",
+                            self._output_name,
                             diagnostic,
                         )
                         self._notify_stream_health(
                             on_stream_health,
-                            "RTMP output process exited unexpectedly.",
+                            f"{self._output_name} process exited unexpectedly.",
                             video_id,
                             health_position,
                             attempt,
@@ -267,14 +352,9 @@ class Streamer:
                     stalled_for = (
                         now - progress_at if has_progress else now - wall_start
                     )
-                    stall_limit = (
-                        self.INPUT_STALL_TIMEOUT_SECONDS
-                        if has_progress
-                        else self.INPUT_STARTUP_TIMEOUT_SECONDS
-                    )
+                    stall_limit = self._input_progress_timeout(has_progress)
                     if stalled_for >= stall_limit:
                         input_stalled = True
-                        output_dropped = True
                         diagnostic = (
                             f"no media progress for {stalled_for:.1f}s; "
                             f"{self._output_process_summary()}"
@@ -295,9 +375,8 @@ class Streamer:
                         break
 
                     emitted_seconds = max(0.0, progress_position - seek_pos)
-                    if (
+                    if self._output_timeline_needs_cycle(
                         output_offset + emitted_seconds
-                        >= self.OUTPUT_MAX_TIMELINE_SECONDS
                     ):
                         planned_output_cycle = True
                         output_dropped = True
@@ -306,12 +385,13 @@ class Streamer:
                             f"{output_offset + emitted_seconds:.1f}s"
                         )
                         logger.info(
-                            "Cycling RTMP output before MPEG-TS timestamp wrap (%s)",
+                            "Cycling %s output before MPEG-TS timestamp wrap (%s)",
+                            self._output_name,
                             diagnostic,
                         )
                         self._notify_stream_health(
                             on_stream_health,
-                            "RTMP output cycled before timestamp wrap.",
+                            f"{self._output_name} cycled before timestamp wrap.",
                             video_id,
                             max(progress_position, saved_position, current_position),
                             attempt,
@@ -330,7 +410,12 @@ class Streamer:
                             saved_position,
                             current_position,
                         )
-                        if self._output_tcp_connection_closed():
+                        output_connection_unhealthy = (
+                            self._output_tcp_connection_closed()
+                            if self._uses_twitch_rtmp
+                            else self._output_obs_client_disconnected()
+                        )
+                        if output_connection_unhealthy:
                             unhealthy_output_checks += 1
                             if (
                                 unhealthy_output_checks
@@ -340,13 +425,14 @@ class Streamer:
                                 self._output_dead.set()
                                 diagnostic = self._output_process_summary()
                                 logger.warning(
-                                    "RTMP output TCP connection unhealthy, "
+                                    "%s output TCP connection unhealthy, "
                                     "restarting stream (%s)",
+                                    self._output_name,
                                     diagnostic,
                                 )
                                 self._notify_stream_health(
                                     on_stream_health,
-                                    "RTMP TCP connection unhealthy.",
+                                    f"{self._output_name} TCP connection unhealthy.",
                                     video_id,
                                     health_position,
                                     attempt,
@@ -366,7 +452,7 @@ class Streamer:
                         ):
                             self._notify_stream_health(
                                 on_stream_health,
-                                "RTMP connection recovered.",
+                                f"{self._output_name} recovered.",
                                 video_id,
                                 health_position,
                                 attempt,
@@ -445,35 +531,51 @@ class Streamer:
                     )
 
                 stderr_joined = " ".join(stderr_tail[-10:])
-                output_failure = output_dropped or (
-                    "Broken pipe" in stderr_joined
-                    or "Input/output error" in stderr_joined
-                    or "Connection reset by peer" in stderr_joined
-                )
                 premature_eof = (
                     returncode == 0
                     and duration > 0
                     and final_position < duration - 5
                 )
-                transient_input_failure = returncode in (-9, 255) or premature_eof or (
-                    "Invalid data found when processing input" in stderr_joined
-                    or "HTTP error 403 Forbidden" in stderr_joined
+                output_failure, transient_input_failure = (
+                    self._classify_ffmpeg_failure(
+                        returncode,
+                        stderr_joined,
+                        output_dropped=output_dropped,
+                        premature_eof=premature_eof,
+                    )
                 )
                 if (output_failure or transient_input_failure) and attempt < max_output_retries:
                     current_position = max(final_position, current_position)
                     logger.warning(
                         "%s dropped, retrying %s at %.1fs (attempt %d/%d)",
-                        "RTMP output" if output_failure else "Input stream",
+                        (
+                            f"{self._output_name} output"
+                            if output_failure
+                            else "Input stream"
+                        ),
                         video_id,
                         current_position,
                         attempt,
                         max_output_retries,
                     )
+                    keep_output = (
+                        not output_failure
+                        and transient_input_failure
+                        and self._keep_output_for_source_failure()
+                    )
                     output_recovery_pending = not planned_output_cycle
-                    # Every retry gets a fresh publisher generation. Otherwise the
-                    # new input would reset PTS inside an already-running MPEG-TS
-                    # timeline and the output would drop packets indefinitely.
-                    self._stop_output_process()
+                    if keep_output:
+                        logger.info(
+                            "Keeping OBS feed connected while replacing failed "
+                            "input stream (generation=%d, next_offset=%.3fs)",
+                            output_generation,
+                            self._output_timeline_seconds,
+                        )
+                    else:
+                        # RTMP and genuine relay failures need a fresh publisher.
+                        # A source-only failure in OBS mode keeps the relay and its
+                        # monotonically increasing timeline alive.
+                        self._stop_output_process()
                     if stop_event.wait(2):
                         return StreamResult(
                             success=True,
@@ -484,7 +586,10 @@ class Streamer:
                 if output_failure or transient_input_failure or returncode != 0:
                     err_tail = f": {' | '.join(stderr_tail[-5:])}" if stderr_tail else ""
                     logger.warning("FFmpeg exited with code %d", returncode)
-                    self._stop_output_process()
+                    if output_failure or not transient_input_failure:
+                        self._stop_output_process()
+                    else:
+                        self._stop_output_unless_source_only_failure()
                     return StreamResult(
                         success=False,
                         final_position=final_position,
@@ -542,7 +647,7 @@ class Streamer:
         return StreamResult(
             success=False,
             final_position=current_position,
-            error="RTMP output dropped repeatedly",
+            error=f"{self._output_name} output dropped repeatedly",
         )
 
     def close(self) -> None:
@@ -580,11 +685,13 @@ class Streamer:
             time.sleep(0.5)
             if self._output_proc.poll() is not None:
                 raise RuntimeError(
-                    f"RTMP output exited with code {self._output_proc.returncode}"
+                    f"{self._output_name} exited with code "
+                    f"{self._output_proc.returncode}"
                 )
 
             playback_logger.info(
-                "Persistent RTMP output started (pid=%s)",
+                "Persistent %s output started (pid=%s)",
+                self._output_name,
                 self._output_proc.pid,
             )
             return (
@@ -641,7 +748,9 @@ class Streamer:
                 return
             self._output_timeline_seconds = max(
                 self._output_timeline_seconds,
-                starting_offset + max(0.0, emitted_seconds),
+                starting_offset
+                + max(0.0, emitted_seconds)
+                + self.OUTPUT_HANDOVER_GAP_SECONDS,
             )
 
     def _cleanup_fifo(self) -> None:
@@ -677,12 +786,13 @@ class Streamer:
             if line:
                 with self._output_stderr_lock:
                     self._output_stderr_tail.append(line)
-                logger.warning("RTMP output: %s", line)
+                logger.warning("%s output: %s", self._output_name, line)
 
         if self._output_proc is proc and not self._closing.is_set():
             self._output_dead.set()
             logger.error(
-                "RTMP output process exited unexpectedly (%s)",
+                "%s output process exited unexpectedly (%s)",
+                self._output_name,
                 self._output_process_summary(proc),
             )
 
@@ -748,6 +858,51 @@ class Streamer:
             )
             return True
 
+        return False
+
+    def _output_obs_client_disconnected(self) -> bool:
+        """Detect a closed TCP peer without treating an idle relay as failed."""
+        proc = self._output_proc
+        if not proc or proc.poll() is not None:
+            return False
+        if (
+            self._output_started_at
+            and time.monotonic() - self._output_started_at
+            < self.OUTPUT_STARTUP_GRACE_SECONDS
+        ):
+            return False
+
+        socket_inodes = self._output_socket_inodes(proc)
+        if not socket_inodes:
+            return False
+
+        try:
+            feed_port = str(
+                urlparse(
+                    getattr(
+                        self.config,
+                        "obs_feed_url",
+                        "tcp://127.0.0.1:5000?listen=1",
+                    )
+                ).port
+                or 5000
+            )
+        except ValueError:
+            return False
+
+        obs_sockets = [
+            socket_info
+            for socket_info in self._output_tcp_sockets(socket_inodes)
+            if socket_info.local.rsplit(":", 1)[-1] == feed_port
+        ]
+        for socket_info in obs_sockets:
+            if socket_info.state in self.TCP_CLOSED_STATES:
+                logger.warning(
+                    "OBS feed socket entered closed TCP state: %s (%s)",
+                    self._format_socket_info(socket_info),
+                    self._output_process_summary(proc),
+                )
+                return True
         return False
 
     def _output_socket_inodes(self, proc: subprocess.Popen[bytes]) -> set[str] | None:
@@ -914,7 +1069,7 @@ class Streamer:
             logger.exception("Stream-health notification failed")
 
     def _build_output_ffmpeg_cmd(self) -> list[str]:
-        return [
+        command = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
@@ -937,6 +1092,28 @@ class Streamer:
             "0:a:0?",
             "-c:v",
             "copy",
+        ]
+
+        if not self._uses_twitch_rtmp:
+            return [
+                *command,
+                "-c:a",
+                "copy",
+                "-flush_packets",
+                "1",
+                "-f",
+                "mpegts",
+                "-mpegts_flags",
+                "+resend_headers",
+                getattr(
+                    self.config,
+                    "obs_feed_url",
+                    "tcp://127.0.0.1:5000?listen=1",
+                ),
+            ]
+
+        return [
+            *command,
             "-c:a",
             "aac",
             "-b:a",

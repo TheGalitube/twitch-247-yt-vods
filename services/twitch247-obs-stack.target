@@ -1,0 +1,7 @@
+[Unit]
+Description=Twitch247 complete OBS and VNC stack
+Wants=network-online.target twitch247-gpu-xorg.service twitch247-obs-vnc.service twitch247-novnc.service twitch247-obs-start.service twitch247.service
+After=network-online.target twitch247-gpu-xorg.service twitch247-obs-vnc.service twitch247-novnc.service twitch247-obs-start.service
+
+[Install]
+WantedBy=multi-user.target

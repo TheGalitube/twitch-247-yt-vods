@@ -1,0 +1,13 @@
+[Unit]
+Description=Start Twitch247 OBS after the GPU display is ready
+Requires=twitch247-gpu-xorg.service user@997.service
+After=twitch247-gpu-xorg.service twitch247-obs-vnc.service user@997.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c 'for n in $(seq 1 30); do test -S /tmp/.X11-unix/X2 && test -S /run/user/997/bus && exit 0; sleep 1; done; exit 1'
+ExecStart=/usr/sbin/runuser -u twitch247 -- /usr/bin/env XDG_RUNTIME_DIR=/run/user/997 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/997/bus /usr/bin/systemctl --user restart twitch247-obs.service
+RemainAfterExit=yes
+
+[Install]
+WantedBy=twitch247-obs-stack.target

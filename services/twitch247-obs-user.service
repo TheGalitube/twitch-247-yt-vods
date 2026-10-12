@@ -1,0 +1,17 @@
+[Unit]
+Description=Twitch247 OBS Studio
+After=default.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:2
+Environment=HOME=/home/twitch247
+Environment=XDG_RUNTIME_DIR=/run/user/997
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/997/bus
+ExecStart=/usr/bin/flatpak run com.obsproject.Studio --disable-shutdown-check
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

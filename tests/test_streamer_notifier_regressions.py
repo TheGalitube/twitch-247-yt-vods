@@ -15,7 +15,7 @@ import requests
 from app.database import Video
 from app.main import Twitch247App
 from app.notifications import Notifier
-from app.streamer import Streamer, StreamResult
+from app.streamer import Streamer, StreamResult, TcpSocketInfo
 from app.youtube_sync import YouTubeSync
 
 
@@ -83,6 +83,20 @@ class StreamResultRegressionTests(unittest.TestCase):
             0.0,
         )
         app.db.save_position.assert_called_once_with("abcdefghijk", 321.0)
+
+    def test_select_video_removes_excluded_shorts_from_stale_queue(self) -> None:
+        app = self._make_app(StreamResult(success=True, final_position=0.0))
+        excluded = self._unknown_duration_video()
+        excluded.title = "Vertical livestream #Shorts"
+        included = self._unknown_duration_video()
+        included.video_id = "lmnopqrstuv"
+        app.db.get_next_video.return_value = included
+
+        selected = app._select_video(excluded)
+
+        self.assertIs(selected, included)
+        app.db.delete_video.assert_called_once_with(excluded.video_id)
+        app.db.get_next_video.assert_called_once_with()
 
     def test_stream_url_resolution_failures_return_result_without_process(
         self,
@@ -171,7 +185,7 @@ class StreamResultRegressionTests(unittest.TestCase):
                     streamer._ensure_output_process()
                 )
                 self.assertEqual(first_generation, same_generation)
-                self.assertEqual(123.0, next_offset)
+                self.assertEqual(123.1, next_offset)
 
                 streamer._stop_output_process()
                 _, second_generation, reset_offset = (
@@ -213,6 +227,195 @@ class StreamResultRegressionTests(unittest.TestCase):
                 streamer.OUTPUT_MAX_TIMELINE_SECONDS,
                 (2**33) / 90_000,
             )
+
+    def test_obs_output_uses_local_mpegts_feed_without_twitch_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                    obs_feed_url="tcp://127.0.0.1:5000?listen=1",
+                    audio_bitrate="160k",
+                )
+            )
+
+            command = streamer._build_output_ffmpeg_cmd()
+
+            self.assertIn("mpegts", command)
+            self.assertEqual(
+                "tcp://127.0.0.1:5000?listen=1",
+                command[-1],
+            )
+            self.assertNotIn("flv", command)
+            self.assertFalse(
+                any(value.startswith("rtmp://") for value in command)
+            )
+
+    def test_obs_source_recovery_preserves_running_output_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                )
+            )
+            output_process = Mock()
+            output_process.poll.return_value = None
+            streamer._output_proc = output_process
+
+            kept_running = streamer._stop_output_unless_source_only_failure()
+
+            self.assertTrue(kept_running)
+            self.assertIs(output_process, streamer._output_proc)
+            output_process.terminate.assert_not_called()
+
+    def test_obs_recovery_uses_shorter_timeout_without_planned_output_cycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                )
+            )
+
+            self.assertEqual(15.0, streamer._input_progress_timeout(True))
+            self.assertEqual(30.0, streamer._input_progress_timeout(False))
+            self.assertFalse(
+                streamer._output_timeline_needs_cycle(
+                    Streamer.OUTPUT_MAX_TIMELINE_SECONDS * 2
+                )
+            )
+
+    def test_direct_rtmp_recovery_keeps_existing_restart_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="rtmp",
+                )
+            )
+
+            self.assertEqual(60.0, streamer._input_progress_timeout(True))
+            self.assertEqual(90.0, streamer._input_progress_timeout(False))
+            self.assertTrue(
+                streamer._output_timeline_needs_cycle(
+                    Streamer.OUTPUT_MAX_TIMELINE_SECONDS
+                )
+            )
+
+    def test_upstream_connection_reset_does_not_close_healthy_obs_relay(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                )
+            )
+            output_process = Mock()
+            output_process.poll.return_value = None
+            streamer._output_proc = output_process
+
+            output_failure, transient_input_failure = (
+                streamer._classify_ffmpeg_failure(
+                    1,
+                    "https input: Connection reset by peer",
+                    output_dropped=False,
+                    premature_eof=False,
+                )
+            )
+
+            self.assertFalse(output_failure)
+            self.assertTrue(transient_input_failure)
+
+    def test_unknown_input_error_does_not_close_healthy_obs_relay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                )
+            )
+            output_process = Mock()
+            output_process.poll.return_value = None
+            streamer._output_proc = output_process
+
+            output_failure, transient_input_failure = (
+                streamer._classify_ffmpeg_failure(
+                    1,
+                    "decoder stopped unexpectedly",
+                    output_dropped=False,
+                    premature_eof=False,
+                )
+            )
+
+            self.assertFalse(output_failure)
+            self.assertTrue(transient_input_failure)
+
+    def test_closed_obs_client_socket_is_detected_without_flagging_idle_relay(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                    obs_feed_url="tcp://127.0.0.1:5000?listen=1",
+                )
+            )
+            output_process = Mock(pid=1234)
+            output_process.poll.return_value = None
+            streamer._output_proc = output_process
+            streamer._output_started_at = 0.0
+            closed_socket = TcpSocketInfo(
+                table="tcp",
+                local="127.0.0.1:5000",
+                remote="127.0.0.1:60474",
+                state="08",
+                inode="1",
+                tx_queue="0",
+                rx_queue="0",
+            )
+            open_socket = TcpSocketInfo(
+                table="tcp",
+                local="127.0.0.1:5000",
+                remote="127.0.0.1:60474",
+                state="01",
+                inode="1",
+                tx_queue="0",
+                rx_queue="0",
+            )
+
+            with patch.object(streamer, "_output_socket_inodes", return_value={"1"}), patch.object(
+                streamer, "_output_tcp_sockets", return_value=[closed_socket]
+            ):
+                self.assertTrue(streamer._output_obs_client_disconnected())
+            with patch.object(streamer, "_output_socket_inodes", return_value={"1"}), patch.object(
+                streamer, "_output_tcp_sockets", return_value=[open_socket]
+            ):
+                self.assertFalse(streamer._output_obs_client_disconnected())
+
+    def test_handover_gap_keeps_successive_input_timestamps_monotonic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            streamer = Streamer(
+                SimpleNamespace(
+                    log_dir=Path(temporary_directory),
+                    stream_output_mode="obs",
+                )
+            )
+            output_process = Mock()
+            output_process.poll.return_value = None
+            streamer._output_proc = output_process
+            streamer._output_generation = 7
+
+            streamer._record_output_progress(7, 100.0, 42.0)
+
+            self.assertEqual(142.1, streamer._output_timeline_seconds)
 
     def test_stream_url_resolution_stops_promptly_on_shutdown(self) -> None:
         process = Mock()

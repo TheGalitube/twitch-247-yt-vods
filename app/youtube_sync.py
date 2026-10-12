@@ -37,7 +37,16 @@ class UnplayableYouTubeVideo(RuntimeError):
 class YouTubeSync:
     DEFAULT_METADATA_WORKERS = 4
     DEFAULT_SYNC_LIMIT = 15
-    EXCLUDED_TITLE_SUBSTRINGS = ("24/7",)
+    EXCLUDED_TITLE_SUBSTRINGS = ("24/7", "#shorts")
+    STREAM_FORMAT = (
+        "bestvideo[vcodec^=avc1][height<=1080][height>=720][fps<=30][ext=mp4]"
+        "+bestaudio[ext=m4a]/"
+        "bestvideo[vcodec^=avc1][height<=1080][ext=mp4]"
+        "+bestaudio[ext=m4a]/"
+        "best[height<=1080][vcodec^=avc1]/"
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+        "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+    )
     YT_DLP_BASE = [
         sys.executable,
         "-m",
@@ -64,6 +73,12 @@ class YouTubeSync:
     @classmethod
     def _yt_dlp_cmd(cls) -> list[str]:
         cmd = [*cls.YT_DLP_BASE]
+        # The web player can issue URLs that work once and then receive 403s
+        # from Googlevideo when FFmpeg opens the next VOD. Android URLs avoid
+        # that browser-only proof-token requirement at the media endpoint.
+        player_client = os.getenv("YOUTUBE_PLAYER_CLIENT", "android").strip()
+        if player_client:
+            cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
         cookies_file = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
         cookies_from_browser = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip()
         if cookies_file:
@@ -340,7 +355,14 @@ class YouTubeSync:
         return (
             "sign in to confirm" in normalized
             and "not a bot" in normalized
-        ) or "use --cookies-from-browser or --cookies" in normalized
+        ) or "use --cookies-from-browser or --cookies" in normalized or (
+            "http error 403 forbidden" in normalized
+            and (
+                "https" in normalized
+                or "source-url" in normalized
+                or "access denied" in normalized
+            )
+        )
 
     @staticmethod
     def get_stream_urls(
@@ -357,8 +379,7 @@ class YouTubeSync:
             *YouTubeSync._yt_dlp_cmd(),
             "-g",
             "-f",
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            YouTubeSync.STREAM_FORMAT,
             url,
         ]
         proc = subprocess.Popen(

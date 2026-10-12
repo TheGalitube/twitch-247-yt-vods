@@ -114,9 +114,16 @@ class Twitch247App:
             logger.info("Twitch247 shutting down")
 
     def _select_video(self, resume: Video | None) -> Video | None:
-        if resume:
-            return resume
-        return self.db.get_next_video()
+        video = resume or self.db.get_next_video()
+        while video and YouTubeSync._title_is_excluded(video.title):
+            logger.info(
+                "Skipping excluded queued video: %s (%s)",
+                video.title,
+                video.video_id,
+            )
+            self.db.delete_video(video.video_id)
+            video = self.db.get_next_video()
+        return video
 
     def _play_video(self, video: Video) -> None:
         position = video.current_position_seconds

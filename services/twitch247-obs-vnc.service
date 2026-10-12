@@ -1,0 +1,18 @@
+[Unit]
+Description=Twitch247 OBS GPU VNC
+Requires=twitch247-gpu-xorg.service
+After=twitch247-gpu-xorg.service
+
+[Service]
+Type=simple
+User=twitch247
+Group=twitch247
+Environment=HOME=/home/twitch247
+Environment=DISPLAY=:2
+ExecStartPre=/bin/sh -c 'for n in $(seq 1 30); do test -S /tmp/.X11-unix/X2 && exit 0; sleep 1; done; exit 1'
+ExecStart=/usr/bin/x0vncserver -display :2 -rfbport 5902 -PasswordFile /home/twitch247/.vnc/passwd -SecurityTypes VncAuth,TLSVnc -AlwaysShared=1 -fg
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=twitch247-obs-stack.target

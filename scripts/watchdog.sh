@@ -46,6 +46,9 @@ DB="${DB_PATH:-$(read_config_value DB_PATH)}"
 DB="${DB:-${APP_ROOT}/database/twitch247.db}"
 LOG_DIR="${LOG_DIR:-$(read_config_value LOG_DIR)}"
 LOG_DIR="${LOG_DIR:-${APP_ROOT}/logs}"
+STREAM_OUTPUT_MODE="${STREAM_OUTPUT_MODE:-$(read_config_value STREAM_OUTPUT_MODE)}"
+STREAM_OUTPUT_MODE="${STREAM_OUTPUT_MODE:-rtmp}"
+STREAM_OUTPUT_MODE="${STREAM_OUTPUT_MODE,,}"
 
 # Prevent a manual run from racing the systemd timer.
 exec 9>"/run/twitch247-watchdog.lock"
@@ -71,6 +74,26 @@ has_healthy_rtmp_socket() {
     done
 
     return 1
+}
+
+has_obs_feed_process() {
+    pgrep -u twitch247 -f \
+        "ffmpeg.*(udp|tcp)://127\\.0\\.0\\.1:5000" >/dev/null 2>&1
+}
+
+restart_streamer_after_obs_grace() {
+    local reason="$1"
+    log "WARN: ${reason} — waiting ${RTMP_SELF_HEAL_GRACE_SECONDS}s for streamer self-heal"
+    sleep "$RTMP_SELF_HEAL_GRACE_SECONDS"
+
+    if has_obs_feed_process; then
+        log "INFO: Local OBS feed recovered during grace period"
+        exit 0
+    fi
+
+    log "WARN: ${reason} persists — restarting streamer"
+    systemctl restart twitch247.service
+    exit 0
 }
 
 restart_streamer_after_grace() {
@@ -325,6 +348,21 @@ fi
 
 IS_STREAMING=$(runuser -u twitch247 -- sqlite3 -readonly "$DB" \
     "SELECT is_streaming FROM playback_state WHERE id=1;" 2>/dev/null || echo 0)
+
+# In OBS mode this service only produces the local UDP feed. OBS owns the
+# Twitch connection and the 48-hour stream cycle, so RTMP/Twitch checks here
+# would incorrectly restart a healthy local renderer.
+if [[ "$STREAM_OUTPUT_MODE" == "obs" ]]; then
+    if [[ "$IS_STREAMING" == "1" ]] && ! has_obs_feed_process; then
+        restart_streamer_after_obs_grace \
+            "is_streaming=1 but no local OBS feed process"
+    fi
+
+    clear_legacy_offline_state
+    log "INFO: Local OBS feed health check passed"
+    exit 0
+fi
+
 if [[ "$IS_STREAMING" == "1" ]]; then
     refresh_twitch_stream_info
     check_twitch_uptime_limit
